@@ -1,0 +1,95 @@
+name: Build & Test Firmware
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run pytest suite
+        run: pytest -v
+
+  build-firmware:
+    name: Build HolyIoT Hex Binaries
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/nrfconnect/sdk-nrf-toolchain:v3.2.4
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+        with:
+          path: app
+
+      - name: Cache nRF Connect SDK workspace
+        id: cache-ncs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .west
+            nrf
+            zephyr
+            modules
+            bootloader
+            tools
+          key: ncs-v3.2.4-matter-workspace-v1
+
+      - name: Initialize and update nRF Connect SDK v3.2.4
+        if: steps.cache-ncs.outputs.cache-hit != 'true'
+        run: |
+          west init -m https://github.com/nrfconnect/sdk-nrf --mr v3.2.4
+          west config manifest.group-filter -- "+matter"
+          west update --narrow -o=--depth=1
+
+      - name: Build HolyIoT 25015 Mode 1 (Dimmer + HA Events)
+        run: |
+          west build -s app -b holyiot_25015/nrf54l15/cpuapp -d build_25015_om1 --no-sysbuild -- \
+            -DBOARD_ROOT=${PWD}/app \
+            -DCONFIG_MATTER_BUTTON_MODE_1=y
+          mkdir -p dist
+          cp build_25015_om1/zephyr/zephyr.hex dist/micro_matter_button_h25015_om1.hex
+
+      - name: Build HolyIoT 25015 Mode 2 (Generic Switch + Rotary HA Events)
+        run: |
+          west build -s app -b holyiot_25015/nrf54l15/cpuapp -d build_25015_om2 --no-sysbuild -- \
+            -DBOARD_ROOT=${PWD}/app \
+            -DCONFIG_MATTER_BUTTON_MODE_2=y
+          cp build_25015_om2/zephyr/zephyr.hex dist/micro_matter_button_h25015_om2.hex
+
+      - name: Build HolyIoT 25008 Mode 1 (Dimmer + HA Events)
+        run: |
+          west build -s app -b holyiot_25008/nrf54l15/cpuapp -d build_25008_om1 --no-sysbuild -- \
+            -DBOARD_ROOT=${PWD}/app \
+            -DCONFIG_MATTER_BUTTON_MODE_1=y
+          cp build_25008_om1/zephyr/zephyr.hex dist/micro_matter_button_h25008_om1.hex
+
+      - name: Build HolyIoT 25008 Mode 2 (Generic Switch + Rotary HA Events)
+        run: |
+          west build -s app -b holyiot_25008/nrf54l15/cpuapp -d build_25008_om2 --no-sysbuild -- \
+            -DBOARD_ROOT=${PWD}/app \
+            -DCONFIG_MATTER_BUTTON_MODE_2=y
+          cp build_25008_om2/zephyr/zephyr.hex dist/micro_matter_button_h25008_om2.hex
+
+      - name: Upload precompiled hex binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: micro_matter_button_hex_binaries
+          path: dist/*.hex

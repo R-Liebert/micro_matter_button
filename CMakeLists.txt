@@ -6,6 +6,8 @@
 
 cmake_minimum_required(VERSION 3.20.0)
 
+list(APPEND BOARD_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+
 find_package(Zephyr HINTS $ENV{ZEPHYR_BASE})
 
 project(micro_matter_button)
@@ -34,6 +36,7 @@ target_compile_options(app PRIVATE -Wno-deprecated-declarations)
 target_sources(app PRIVATE
   src/app_task.cpp
   src/light_switch.cpp
+  src/rotary_dimmer.cpp
   src/main.cpp
   src/shell_commands.cpp
   ${ZEPHYR_NRF_MODULE_DIR}/samples/matter/common/src/binding/binding_handler.cpp

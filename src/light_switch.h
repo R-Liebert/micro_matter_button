@@ -23,6 +23,7 @@ public:
 	void Init(chip::EndpointId lightSwitchEndpoint);
 	void InitiateActionSwitch(Action action);
 	void SetBrightnessLevel(uint8_t targetLevel);
+	void StepBrightness(int16_t stepDelta);
 	void DimmerChangeBrightness();
 	
 	chip::EndpointId GetLightSwitchEndpointId() { return mLightSwitchEndpoint; }

@@ -7,6 +7,7 @@
 #include "app_task.h"
 
 #include "light_switch.h"
+#include "rotary_dimmer.h"
 
 #include "app/matter_init.h"
 #include "app/task_executor.h"
@@ -15,23 +16,20 @@
 
 #include <setup_payload/OnboardingCodesUtil.h>
 
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/spi.h>
 #include <zephyr/logging/log.h>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
+#include <app-common/zap-generated/attributes/Accessors.h>
+#include <app/clusters/switch-server/switch-server.h>
 #include <app/server/Server.h>
+#include <app/util/endpoint-config-api.h>
 #include <platform/CHIPDeviceLayer.h>
 
 #include <dk_buttons_and_leds.h>
-
-#ifdef CONFIG_MATTER_BUTTON_MODE_2
-#include <app/clusters/switch-server/switch-server.h>
-#endif
-
-#ifdef CONFIG_SHT4X
-#include <app-common/zap-generated/attributes/Accessors.h>
-#endif
-
-#include <app/util/endpoint-config-api.h>
 
 LOG_MODULE_DECLARE(app, CONFIG_CHIP_APP_LOG_LEVEL);
 
@@ -39,11 +37,15 @@ using namespace ::chip;
 using namespace ::chip::app;
 using namespace ::chip::DeviceLayer;
 
-/* --- Raw SPI for accelerometer ------------------------------------------- */
-#include <zephyr/drivers/spi.h>
+/* --- Raw SPI & INT1 GPIO for LIS2DH12 accelerometer ---------------------- */
 
 static const struct spi_dt_spec sAccelBus =
 	SPI_DT_SPEC_GET(DT_ALIAS(accel0), SPI_WORD_SET(8) | SPI_TRANSFER_MSB, 0);
+
+static const struct gpio_dt_spec sAccelInt1Gpio =
+	GPIO_DT_SPEC_GET_BY_IDX(DT_ALIAS(accel0), irq_gpios, 0);
+
+static struct gpio_callback sAccelInt1CbData;
 
 static void WriteAccelRegister(uint8_t reg, uint8_t val)
 {
@@ -56,11 +58,21 @@ static void WriteAccelRegister(uint8_t reg, uint8_t val)
 	}
 }
 
+static uint8_t ReadAccelRegister(uint8_t reg)
+{
+	uint8_t tx_buf[2] = { static_cast<uint8_t>(reg | 0x80U), 0x00U };
+	uint8_t rx_buf[2] = { 0x00U, 0x00U };
+	struct spi_buf tx_spi_buf = { .buf = tx_buf, .len = 2 };
+	struct spi_buf rx_spi_buf = { .buf = rx_buf, .len = 2 };
+	struct spi_buf_set tx_set = { .buffers = &tx_spi_buf, .count = 1 };
+	struct spi_buf_set rx_set = { .buffers = &rx_spi_buf, .count = 1 };
+	if (spi_transceive_dt(&sAccelBus, &tx_set, &rx_set) != 0) {
+		return 0;
+	}
+	return rx_buf[1];
+}
+
 /* --- LPS22HB power-down (25015 only) ------------------------------------- */
-/* No native SPI driver exists for LPS22HB in NCS; pressure sensing is not
- * implemented. The sensor is explicitly placed in power-down mode at boot
- * since it defaults to ODR=0 on a cold power-up but may retain state across
- * soft resets. */
 #ifdef CONFIG_SHT4X
 
 static const struct spi_dt_spec sLps22hbBus = {
@@ -93,20 +105,13 @@ constexpr EndpointId kTempEndpointId = 3;
 constexpr EndpointId kHumEndpointId = 4;
 constexpr EndpointId kPressureEndpointId = 5;
 
-/* Mode 1: accelerometer dimming */
-constexpr uint32_t kAccelPollInterval = 50;
-constexpr uint32_t kMovementSettlingTimeMs = 150;
-constexpr uint32_t kTapWakeDurationMs = 10000;
-constexpr uint32_t kRotationWakeExtensionMs = 3000;
-constexpr double kPi = 3.14159265358979323846;
-constexpr double kRotationToLevelMultiplier = 40.0;
+/* Accelerometer rotational dimming */
+constexpr uint32_t kAccelPollIntervalMs = 50;
+constexpr uint32_t kRotationWakeExtensionMs = 2500;
 
-/* Mode 2: GPIO long-press dimming */
+/* GPIO long-press dimming */
 constexpr uint32_t kDimmerTriggeredTimeout = 500;
 constexpr uint32_t kDimmerInterval = 300;
-
-/* Mode 3: generic switch long-press threshold */
-constexpr uint32_t kLongPressThresholdMs = 500;
 
 /* Factory reset: 12s warning, 15s trigger */
 constexpr uint32_t kFactoryResetWarningMs = 12000;
@@ -116,7 +121,7 @@ constexpr uint32_t kFactoryResetTriggerMs = 15000;
 constexpr uint32_t kSlowBlinkOnMs = 50;
 constexpr uint32_t kSlowBlinkOffMs = 950;
 constexpr uint32_t kFastBlinkMs = 100;
-constexpr uint32_t kFactoryWarningWhiteMs = 500; /* white flash duration — matches DK library blink rate */
+constexpr uint32_t kFactoryWarningWhiteMs = 500;
 
 /* Sensor poll: every 5 minutes */
 constexpr uint32_t kSensorPollIntervalMs = 300000;
@@ -135,26 +140,16 @@ k_timer sSensorPollTimer;
 
 Nrf::Matter::IdentifyCluster sIdentifyCluster(kLightEndpointId);
 
-/* --- Mode 1 state --- */
-#ifdef CONFIG_MATTER_BUTTON_MODE_1
+/* --- Accelerometer & dimming state --- */
 const struct device *sAccelDevice = nullptr;
-double sLastAngle = 0.0;
-bool sFirstPollAfterWake = false;
-uint32_t sLastButtonPressTime = 0;
-double sAccumulatedBrightness = 127.0;
-uint8_t sLastSentBrightness = 127;
-uint32_t sLastMovementTime = 0;
+RotaryDimmer sRotaryDimmer;
+bool sAccelPollingActive = false;
+bool sAccelInt1Ready = false;
 bool sDimmerTriggered = false;
-#endif
-
-/* --- Mode 2 state --- */
-#ifdef CONFIG_MATTER_BUTTON_MODE_2
-bool sLongPressTriggered = false;
-#endif
 
 /* --- Factory reset state --- */
 bool sInFactoryWarning = false;
-uint8_t sFactoryWarningBlinksRemaining = 0; /* counts remaining 500ms half-cycles */
+uint8_t sFactoryWarningBlinksRemaining = 0;
 
 /* --- LED state --- */
 enum class LedState { SlowBlink, FastBlink, Off };
@@ -179,12 +174,109 @@ bool sIsSensorTimerStarted = false;
 #endif
 } /* namespace */
 
+/* --- Accelerometer Wake-on-Turn Interrupt -------------------------------- */
+
+static void AccelInt1Isr(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+{
+	ARG_UNUSED(port);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+
+	gpio_pin_interrupt_configure_dt(&sAccelInt1Gpio, GPIO_INT_DISABLE);
+	Nrf::PostTask([] { AppTask::Instance().UpdateClusterState(); });
+}
+
+void AppTask::EnterAccelIdleMode()
+{
+	sAccelPollingActive = false;
+	Instance().CancelTimer(Timer::AccelPoll);
+	Instance().CancelTimer(Timer::AccelSleep);
+
+	if (!sAccelDevice) {
+		return;
+	}
+
+	/* Configure LIS2DH12 for 10Hz Low-Power (~3 uA) Wake-on-Turn on INT1 (P2.00):
+	 * - CTRL_REG1 (0x20) = 0x2F: ODR=10Hz, LPen=1, Z/Y/X enabled
+	 * - CTRL_REG2 (0x21) = 0x01: High-pass filter enabled for AOI1 (INT1), bypassed for output data
+	 * - CTRL_REG3 (0x22) = 0x40: Route IA1 interrupt to INT1 pin
+	 * - CTRL_REG4 (0x23) = 0x80: BDU=1, +/-2g full scale
+	 * - CTRL_REG5 (0x24) = 0x00: Non-latched INT1
+	 * - INT1_THS  (0x32) = 0x06: ~96 mg threshold (~6 deg rotation on vertical wall)
+	 * - INT1_DUR  (0x33) = 0x00: Immediate trigger
+	 * - INT1_CFG  (0x30) = 0x0A: XHIE | YHIE (wake on X or Y gravity shift)
+	 */
+	WriteAccelRegister(0x20, 0x2F);
+	WriteAccelRegister(0x21, 0x01);
+	WriteAccelRegister(0x22, 0x40);
+	WriteAccelRegister(0x23, 0x80);
+	WriteAccelRegister(0x24, 0x00);
+	WriteAccelRegister(0x32, 0x06);
+	WriteAccelRegister(0x33, 0x00);
+	WriteAccelRegister(0x30, 0x0A);
+
+	/* Dummy-read REFERENCE (0x26) to zero the high-pass filter at the current resting angle */
+	(void)ReadAccelRegister(0x26);
+	(void)ReadAccelRegister(0x31);
+
+	if (sAccelInt1Ready) {
+		gpio_pin_interrupt_configure_dt(&sAccelInt1Gpio, GPIO_INT_EDGE_TO_ACTIVE);
+	}
+}
+
+void AppTask::StartAccelDimming()
+{
+	if (!sAccelDevice) {
+		return;
+	}
+
+	if (sAccelInt1Ready) {
+		gpio_pin_interrupt_configure_dt(&sAccelInt1Gpio, GPIO_INT_DISABLE);
+	}
+
+	if (!sAccelPollingActive) {
+		LOG_INF("Wake-on-turn triggered — starting active rotation tracking.");
+		/* CTRL_REG1 (0x20) = 0x57: 100Hz Normal mode, Z/Y/X enabled */
+		WriteAccelRegister(0x20, 0x57);
+		sRotaryDimmer.ResetOnWake();
+		sAccelPollingActive = true;
+		Instance().StartTimer(Timer::AccelPoll, kAccelPollIntervalMs);
+	}
+
+	Server::GetInstance().GetICDManager().OnNetworkActivity();
+	Instance().StartTimer(Timer::AccelSleep, kRotationWakeExtensionMs);
+}
+
+void AppTask::EmitRotationStep(const RotaryUpdate &update)
+{
+	if (!update.hasStep || update.stepPercent == 0) {
+		return;
+	}
+
+	Server::GetInstance().GetICDManager().OnNetworkActivity();
+
+	uint8_t stepPct = static_cast<uint8_t>(std::clamp<int>(std::abs(update.stepPercent), 1, 100));
+	chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, stepPct);
+
+	if (update.stepPercent > 0) {
+		LOG_INF("Rotate CW: +%u%% (level +%d)", stepPct, update.stepLevel);
+		chip::app::Clusters::SwitchServer::Instance().OnLongPress(kGenericSwitchEndpointId, stepPct);
+	} else {
+		LOG_INF("Rotate CCW: -%u%% (level %d)", stepPct, update.stepLevel);
+		chip::app::Clusters::SwitchServer::Instance().OnLongRelease(kGenericSwitchEndpointId, stepPct);
+	}
+
+#ifdef CONFIG_MATTER_BUTTON_MODE_1
+	LightSwitch::GetInstance().StepBrightness(update.stepLevel);
+#endif
+}
+
 /* --- LED management ------------------------------------------------------ */
 
 void AppTask::UpdateStatusLed()
 {
 	if (sInFactoryWarning) {
-		return; /* LEDs controlled by factory reset warning logic */
+		return;
 	}
 
 	CancelTimer(Timer::StatusLedBlink);
@@ -229,10 +321,6 @@ void AppTask::MatterEventHandler(const chip::DeviceLayer::ChipDeviceEvent *event
 		return;
 	}
 
-	/* Always read live from FabricTable — never cache commissioned state.
-	 * A cached bool starts false and a BLE advertising event on a commissioned
-	 * reboot would incorrectly start the blink timer before kThreadStateChange
-	 * corrects it, preventing ICD deep sleep. */
 	bool isCommissioned = Server::GetInstance().GetFabricTable().FabricCount() > 0;
 
 	if (isCommissioned) {
@@ -245,9 +333,8 @@ void AppTask::MatterEventHandler(const chip::DeviceLayer::ChipDeviceEvent *event
 	Instance().UpdateStatusLed();
 }
 
-/* --- Mode 1: accelerometer poll ------------------------------------------ */
+/* --- Accelerometer poll -------------------------------------------------- */
 
-#ifdef CONFIG_MATTER_BUTTON_MODE_1
 void AppTask::AccelPollEventHandler()
 {
 	if (!sAccelDevice) {
@@ -268,68 +355,21 @@ void AppTask::AccelPollEventHandler()
 	double y = sensor_value_to_double(&accel[1]);
 	double z = sensor_value_to_double(&accel[2]);
 
-	if (std::abs(z) > 7.5) {
-		LOG_INF("Horizontal tilt — stopping dimming.");
-		uint8_t targetLevel = (uint8_t)sAccumulatedBrightness;
-		if (targetLevel != sLastSentBrightness) {
-			LightSwitch::GetInstance().SetBrightnessLevel(targetLevel);
-			sLastSentBrightness = targetLevel;
-		}
-		Instance().CancelTimer(Timer::AccelPoll);
-		Instance().CancelTimer(Timer::AccelSleep);
-		WriteAccelRegister(0x20, 0x00); /* Power-down until next double-tap */
-		return;
-	}
+	RotaryUpdate update = sRotaryDimmer.ProcessSample(x, y, z, k_uptime_get_32());
 
-	double magnitude_sq = (x * x) + (y * y);
-	if (magnitude_sq < 9.0) {
-		sLastAngle = std::atan2(y, x);
-		sLastMovementTime = k_uptime_get_32();
-		return;
-	}
-
-	double currentAngle = std::atan2(y, x);
-
-	if (sFirstPollAfterWake) {
-		sLastAngle = currentAngle;
-		sFirstPollAfterWake = false;
-		return;
-	}
-
-	double deltaAngle = currentAngle - sLastAngle;
-	if (deltaAngle > kPi) {
-		deltaAngle -= 2.0 * kPi;
-	} else if (deltaAngle < -kPi) {
-		deltaAngle += 2.0 * kPi;
-	}
-
-	uint32_t now = k_uptime_get_32();
-
-	if (std::abs(deltaAngle) >= 0.05) {
-		sAccumulatedBrightness += (deltaAngle * kRotationToLevelMultiplier);
-		if (sAccumulatedBrightness > 254.0) {
-			sAccumulatedBrightness = 254.0;
-		}
-		if (sAccumulatedBrightness < 1.0) {
-			sAccumulatedBrightness = 1.0;
-		}
-		sLastAngle = currentAngle;
-		sLastMovementTime = now;
+	if (update.movementDetected) {
 		Instance().StartTimer(Timer::AccelSleep, kRotationWakeExtensionMs);
-	} else {
-		if ((now - sLastMovementTime) > kMovementSettlingTimeMs) {
-			uint8_t targetLevel = (uint8_t)sAccumulatedBrightness;
-			if (targetLevel != sLastSentBrightness) {
-				LOG_INF("Movement settled — brightness: %d", targetLevel);
-				LightSwitch::GetInstance().SetBrightnessLevel(targetLevel);
-				sLastSentBrightness = targetLevel;
-			}
-		}
+	}
+
+	if (update.hasStep) {
+		EmitRotationStep(update);
+	}
+
+	if (update.stopDimming) {
+		LOG_INF("Horizontal tilt — returning accelerometer to idle wake-on-turn mode.");
+		EnterAccelIdleMode();
 	}
 }
-#else
-void AppTask::AccelPollEventHandler() {}
-#endif /* CONFIG_MATTER_BUTTON_MODE_1 */
 
 /* --- 25015 sensor reading ------------------------------------------------ */
 
@@ -364,14 +404,7 @@ void AppTask::SensorUpdateEventHandler()
 void AppTask::TimerEventHandler(const Timer &timerType)
 {
 	switch (timerType) {
-
-#ifdef CONFIG_MATTER_BUTTON_MODE_1
 	case Timer::SingleTap:
-		/* Only toggle if the button is no longer held — if still held, DimmerTrigger handles it */
-		if (!(dk_get_buttons() & APPLICATION_BUTTON_MASK)) {
-			LOG_INF("Single tap — toggling light.");
-			LightSwitch::GetInstance().InitiateActionSwitch(LightSwitch::Action::Toggle);
-		}
 		break;
 
 	case Timer::AccelPoll:
@@ -379,35 +412,32 @@ void AppTask::TimerEventHandler(const Timer &timerType)
 		break;
 
 	case Timer::AccelSleep:
-		LOG_INF("Accel inactivity timeout — stopping dimming.");
-		k_timer_stop(&sAccelPollTimer);
-		WriteAccelRegister(0x20, 0x00); /* Power-down until next double-tap */
+		LOG_INF("Accel inactivity timeout — returning to low-power wake-on-turn mode.");
+		EnterAccelIdleMode();
 		break;
 
 	case Timer::DimmerTrigger:
-		LOG_INF("Long press — starting brightness cycle.");
-		Instance().CancelTimer(Timer::SingleTap);
 		sDimmerTriggered = true;
+#ifdef CONFIG_MATTER_BUTTON_MODE_1
+		LOG_INF("Long press — starting bound brightness cycle.");
 		LightSwitch::GetInstance().InitiateActionSwitch(LightSwitch::Action::On);
 		Instance().StartTimer(Timer::Dimmer, kDimmerInterval);
+#endif
 		break;
 
 	case Timer::Dimmer:
+#ifdef CONFIG_MATTER_BUTTON_MODE_1
 		LightSwitch::GetInstance().DimmerChangeBrightness();
+#endif
 		break;
-#endif /* CONFIG_MATTER_BUTTON_MODE_1 */
 
-#ifdef CONFIG_MATTER_BUTTON_MODE_2
 	case Timer::LongPressDetect:
-		sLongPressTriggered = true;
-		chip::app::Clusters::SwitchServer::Instance().OnLongPress(kGenericSwitchEndpointId, 1);
 		break;
-#endif /* CONFIG_MATTER_BUTTON_MODE_2 */
 
 	case Timer::FactoryWarning:
 		LOG_INF("Factory reset warning — release to cancel, or hold to reset.");
 		sInFactoryWarning = true;
-		sFactoryWarningBlinksRemaining = 5; /* 5 half-cycles → 3 on-periods at 500ms = 3 white blinks */
+		sFactoryWarningBlinksRemaining = 5;
 		sStatusLedOn = true;
 		dk_set_led_on(DK_LED1);
 		dk_set_led_on(DK_LED2);
@@ -422,7 +452,6 @@ void AppTask::TimerEventHandler(const Timer &timerType)
 
 	case Timer::StatusLedBlink:
 		if (sInFactoryWarning) {
-			/* Toggle all 3 LEDs (white blink) */
 			sStatusLedOn = !sStatusLedOn;
 			if (sStatusLedOn) {
 				dk_set_led_on(DK_LED1);
@@ -437,7 +466,6 @@ void AppTask::TimerEventHandler(const Timer &timerType)
 			if (sFactoryWarningBlinksRemaining > 0) {
 				StartTimer(Timer::StatusLedBlink, kFactoryWarningWhiteMs);
 			} else {
-				/* Blink sequence done — LEDs are off; restore commissioning indicator */
 				sInFactoryWarning = false;
 				Instance().UpdateStatusLed();
 			}
@@ -468,47 +496,24 @@ void AppTask::ButtonEventHandler(Nrf::ButtonState state, Nrf::ButtonMask hasChan
 	if (APPLICATION_BUTTON_MASK & hasChanged) {
 		if (APPLICATION_BUTTON_MASK & state) {
 			/* Button pressed */
-
-			/* Always restart factory reset timers on each press */
 			sInFactoryWarning = false;
 			Instance().CancelTimer(Timer::FactoryWarning);
 			Instance().CancelTimer(Timer::FactoryReset);
 			Instance().StartTimer(Timer::FactoryWarning, kFactoryResetWarningMs);
 			Instance().StartTimer(Timer::FactoryReset, kFactoryResetTriggerMs);
 
-#ifdef CONFIG_MATTER_BUTTON_MODE_1
-			uint32_t now = k_uptime_get_32();
-			if (now - sLastButtonPressTime < 400) {
-				/* Double tap — cancel pending timers, wake accel */
-				Instance().CancelTimer(Timer::SingleTap);
-				Instance().CancelTimer(Timer::DimmerTrigger);
-				LOG_INF("GPIO double tap — starting accel dimming.");
-				WriteAccelRegister(0x20, 0x77); /* 400Hz normal mode — powered down at all other times */
-				sFirstPollAfterWake = true;
-				sLastMovementTime = now;
-				Instance().StartTimer(Timer::AccelPoll, kAccelPollInterval);
-				Instance().StartTimer(Timer::AccelSleep, kTapWakeDurationMs);
-			} else {
-				/* First press — wait for double tap or long press */
-				sDimmerTriggered = false;
-				Instance().StartTimer(Timer::SingleTap, 400);
-				Instance().StartTimer(Timer::DimmerTrigger, kDimmerTriggeredTimeout);
-			}
-			sLastButtonPressTime = now;
-#endif
+			sDimmerTriggered = false;
+			StartAccelDimming();
 
-#ifdef CONFIG_MATTER_BUTTON_MODE_2
-			sLongPressTriggered = false;
+			chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, 1);
 			chip::app::Clusters::SwitchServer::Instance().OnInitialPress(kGenericSwitchEndpointId, 1);
-			Instance().StartTimer(Timer::LongPressDetect, kLongPressThresholdMs);
-#endif
+			Instance().StartTimer(Timer::DimmerTrigger, kDimmerTriggeredTimeout);
 		} else {
 			/* Button released */
 			Instance().CancelTimer(Timer::FactoryWarning);
 			Instance().CancelTimer(Timer::FactoryReset);
 
 			if (sInFactoryWarning) {
-				/* Released during warning window — cancel factory reset */
 				LOG_INF("Factory reset cancelled.");
 				sInFactoryWarning = false;
 				sFactoryWarningBlinksRemaining = 0;
@@ -518,24 +523,19 @@ void AppTask::ButtonEventHandler(Nrf::ButtonState state, Nrf::ButtonMask hasChan
 				return;
 			}
 
-#ifdef CONFIG_MATTER_BUTTON_MODE_1
 			Instance().CancelTimer(Timer::DimmerTrigger);
 			if (sDimmerTriggered) {
 				Instance().CancelTimer(Timer::Dimmer);
 				sDimmerTriggered = false;
-			}
-			/* Short press: SingleTap timer is still running and will fire the toggle */
-#endif
-
-#ifdef CONFIG_MATTER_BUTTON_MODE_2
-			Instance().CancelTimer(Timer::LongPressDetect);
-			if (sLongPressTriggered) {
-				chip::app::Clusters::SwitchServer::Instance().OnLongRelease(kGenericSwitchEndpointId, 1);
-				sLongPressTriggered = false;
 			} else {
+				/* Short press: emit ShortRelease to Home Assistant and Toggle to bound lights */
+				LOG_INF("Short press — toggling light.");
+				chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, 0);
 				chip::app::Clusters::SwitchServer::Instance().OnShortRelease(kGenericSwitchEndpointId, 1);
-			}
+#ifdef CONFIG_MATTER_BUTTON_MODE_1
+				LightSwitch::GetInstance().InitiateActionSwitch(LightSwitch::Action::Toggle);
 #endif
+			}
 		}
 
 #ifdef CONFIG_CHIP_ICD_UAT_SUPPORT
@@ -630,16 +630,16 @@ void AppTask::UserTimerTimeoutCallback(k_timer *timer)
 	}
 
 	Timer timerType;
-	if (timer == &sSingleTapTimer)         timerType = Timer::SingleTap;
-	else if (timer == &sAccelPollTimer)    timerType = Timer::AccelPoll;
-	else if (timer == &sAccelSleepTimer)   timerType = Timer::AccelSleep;
+	if (timer == &sSingleTapTimer)          timerType = Timer::SingleTap;
+	else if (timer == &sAccelPollTimer)     timerType = Timer::AccelPoll;
+	else if (timer == &sAccelSleepTimer)    timerType = Timer::AccelSleep;
 	else if (timer == &sDimmerTriggerTimer) timerType = Timer::DimmerTrigger;
 	else if (timer == &sDimmerTimer)        timerType = Timer::Dimmer;
-	else if (timer == &sLongPressTimer)    timerType = Timer::LongPressDetect;
+	else if (timer == &sLongPressTimer)     timerType = Timer::LongPressDetect;
 	else if (timer == &sFactoryWarningTimer) timerType = Timer::FactoryWarning;
-	else if (timer == &sFactoryResetTimer) timerType = Timer::FactoryReset;
+	else if (timer == &sFactoryResetTimer)  timerType = Timer::FactoryReset;
 	else if (timer == &sStatusLedBlinkTimer) timerType = Timer::StatusLedBlink;
-	else if (timer == &sSensorPollTimer)   timerType = Timer::SensorPoll;
+	else if (timer == &sSensorPollTimer)    timerType = Timer::SensorPoll;
 	else return;
 
 	Nrf::PostTask([timerType]() { TimerEventHandler(timerType); });
@@ -666,19 +666,21 @@ CHIP_ERROR AppTask::Init()
 	k_timer_init(&sStatusLedBlinkTimer,  AppTask::UserTimerTimeoutCallback, nullptr);
 	k_timer_init(&sSensorPollTimer,      AppTask::UserTimerTimeoutCallback, nullptr);
 
-	/* Accelerometer: active in Mode 1, powered down in Mode 2 */
-#ifdef CONFIG_MATTER_BUTTON_MODE_1
+	/* Accelerometer: Wake-on-Turn enabled via LIS2DH12 INT1 (P2.00) */
 	sAccelDevice = DEVICE_DT_GET(DT_ALIAS(accel0));
 	if (!device_is_ready(sAccelDevice)) {
 		LOG_ERR("Accelerometer not ready.");
 		sAccelDevice = nullptr;
 	} else {
-		WriteAccelRegister(0x20, 0x00); /* CTRL_REG1: power-down — woken on demand at double-tap */
+		if (gpio_is_ready_dt(&sAccelInt1Gpio) &&
+		    gpio_pin_configure_dt(&sAccelInt1Gpio, GPIO_INPUT) == 0) {
+			gpio_init_callback(&sAccelInt1CbData, AccelInt1Isr, BIT(sAccelInt1Gpio.pin));
+			if (gpio_add_callback(sAccelInt1Gpio.port, &sAccelInt1CbData) == 0) {
+				sAccelInt1Ready = true;
+			}
+		}
+		EnterAccelIdleMode();
 	}
-#else
-	/* Power down the accelerometer to save current */
-	WriteAccelRegister(0x20, 0x00); /* CTRL_REG1: power-down mode */
-#endif
 
 	/* Environmental sensors (25015 only) */
 #ifdef CONFIG_SHT4X
@@ -687,13 +689,10 @@ CHIP_ERROR AppTask::Init()
 		LOG_ERR("SHT40 not ready.");
 		sSht40Device = nullptr;
 	} else {
-		/* LPS22HB: force power-down (ODR=0) — not used, but may retain state across soft resets */
 		WriteLps22hbRegister(0x10, 0x00); /* CTRL_REG1: power-down mode */
-		/* Sensor poll timer started only after commissioning — see MatterEventHandler */
 	}
 #endif
 
-	/* Init LED GPIOs — the board module skips this when NCS_SAMPLE_MATTER_LEDS=n */
 	int led_err = dk_leds_init();
 	if (led_err) {
 		LOG_ERR("LED init failed: %d", led_err);
@@ -708,16 +707,15 @@ CHIP_ERROR AppTask::Init()
 	ReturnErrorOnFailure(Nrf::Matter::RegisterEventHandler(AppTask::MatterEventHandler, 0));
 	ReturnErrorOnFailure(sIdentifyCluster.Init());
 
-	/* Start the Matter server first so the FabricTable is loaded from persistent storage */
 	CHIP_ERROR err = Nrf::Matter::StartServer();
 	if (err != CHIP_NO_ERROR) {
 		return err;
 	}
 
-	/* Disable endpoints that are unused in the selected operating mode */
-#ifdef CONFIG_MATTER_BUTTON_MODE_1
-	emberAfEndpointEnableDisable(kGenericSwitchEndpointId, false);
-#endif
+	/* Configure Endpoint 2 Switch cluster to support 0..100% step positions for Home Assistant */
+	chip::app::Clusters::Switch::Attributes::NumberOfPositions::Set(kGenericSwitchEndpointId, 100);
+	chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, 0);
+
 #ifdef CONFIG_MATTER_BUTTON_MODE_2
 	emberAfEndpointEnableDisable(kLightSwitchEndpointId, false);
 #endif
@@ -727,14 +725,10 @@ CHIP_ERROR AppTask::Init()
 	emberAfEndpointEnableDisable(kTempEndpointId, false);
 	emberAfEndpointEnableDisable(kHumEndpointId, false);
 #endif
-	/* Pressure sensor (LPS22HB) not implemented — always disable EP5 */
 	emberAfEndpointEnableDisable(kPressureEndpointId, false);
 
 	bool commissioned = Server::GetInstance().GetFabricTable().FabricCount() > 0;
 
-	/* On reboot, if already commissioned, fire the sensor timer immediately (K_NO_WAIT)
-	 * then repeat every 5 minutes.  On a fresh unpaired device the timer stays stopped
-	 * until kCommissioningComplete fires in MatterEventHandler. */
 #ifdef CONFIG_SHT4X
 	if (commissioned && sSht40Device && !sIsSensorTimerStarted) {
 		LOG_INF("Device already commissioned — starting sensor measurements.");
@@ -743,14 +737,16 @@ CHIP_ERROR AppTask::Init()
 	}
 #endif
 
-	/* Set initial LED state based on commissioning status */
 	sLedState = commissioned ? LedState::Off : LedState::SlowBlink;
 	UpdateStatusLed();
 
 	return CHIP_NO_ERROR;
 }
 
-void AppTask::UpdateClusterState() {}
+void AppTask::UpdateClusterState()
+{
+	StartAccelDimming();
+}
 
 CHIP_ERROR AppTask::StartApp()
 {

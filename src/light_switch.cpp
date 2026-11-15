@@ -16,6 +16,8 @@
 #include <controller/InvokeInteraction.h>
 #include <platform/CHIPDeviceLayer.h>
 #include <zephyr/logging/log.h>
+#include <algorithm>
+#include <cstdlib>
 
 using namespace chip;
 using namespace chip::app;
@@ -74,6 +76,25 @@ void LightSwitch::SetBrightnessLevel(uint8_t targetLevel)
 		
 		data->Value = targetLevel;
 		
+		Nrf::Matter::BindingHandler::RunBoundClusterAction(data);
+	}
+}
+
+void LightSwitch::StepBrightness(int16_t stepDelta)
+{
+	if (stepDelta == 0) {
+		return;
+	}
+	Nrf::Matter::BindingHandler::BindingData *data = Platform::New<Nrf::Matter::BindingHandler::BindingData>();
+	if (data) {
+		data->EndpointId = mLightSwitchEndpoint;
+		data->CommandId = Clusters::LevelControl::Commands::StepWithOnOff::Id;
+		data->ClusterId = Clusters::LevelControl::Id;
+		data->InvokeCommandFunc = SwitchChangedHandler;
+
+		uint8_t magnitude = static_cast<uint8_t>(std::min<int16_t>(std::abs(stepDelta), 127));
+		data->Value = (stepDelta < 0) ? static_cast<uint8_t>(magnitude | 0x80) : magnitude;
+
 		Nrf::Matter::BindingHandler::RunBoundClusterAction(data);
 	}
 }
@@ -233,6 +254,24 @@ void LightSwitch::LevelControlProcessCommand(CommandId commandId, const Binding:
 			Messaging::ExchangeManager &exchangeMgr = Server::GetInstance().GetExchangeManager();
 			ret = Controller::InvokeGroupCommandRequest(&exchangeMgr, binding.fabricIndex, binding.groupId,
 								    moveToLevelCommand);
+		}
+	} break;
+	case Clusters::LevelControl::Commands::StepWithOnOff::Id: {
+		Clusters::LevelControl::Commands::StepWithOnOff::Type stepCommand;
+		bool stepDown = (bindingData.Value & 0x80) != 0;
+		stepCommand.stepMode = stepDown ? Clusters::LevelControl::StepModeEnum::kDown
+						: Clusters::LevelControl::StepModeEnum::kUp;
+		stepCommand.stepSize = static_cast<uint8_t>(bindingData.Value & 0x7F);
+		stepCommand.transitionTime.SetNonNull(2);
+
+		if (device) {
+			ret = Controller::InvokeCommandRequest(device->GetExchangeManager(),
+							       device->GetSecureSession().Value(), binding.remote,
+							       stepCommand, onSuccess, onFailure);
+		} else {
+			Messaging::ExchangeManager &exchangeMgr = Server::GetInstance().GetExchangeManager();
+			ret = Controller::InvokeGroupCommandRequest(&exchangeMgr, binding.fabricIndex, binding.groupId,
+								    stepCommand);
 		}
 	} break;
 	default:

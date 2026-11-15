@@ -7,6 +7,7 @@
 #pragma once
 
 #include "board/board.h"
+#include "rotary_dimmer.h"
 
 #include <platform/CHIPDeviceLayer.h>
 #include <zephyr/drivers/sensor.h>
@@ -29,14 +30,14 @@ public:
 
 private:
 	enum Timer : uint8_t {
-		/* Mode 1: accelerometer dimming */
+		/* Accelerometer rotational dimming */
 		SingleTap,
 		AccelPoll,
 		AccelSleep,
-		/* Mode 2: GPIO long-press dimming */
+		/* GPIO long-press dimming */
 		DimmerTrigger,
 		Dimmer,
-		/* Mode 3: generic switch */
+		/* Generic switch long-press */
 		LongPressDetect,
 		/* All modes: factory reset */
 		FactoryWarning,
@@ -52,6 +53,9 @@ private:
 	static void TimerEventHandler(const Timer &event);
 	static void ButtonEventHandler(Nrf::ButtonState state, Nrf::ButtonMask hasChanged);
 
+	static void EnterAccelIdleMode();
+	static void StartAccelDimming();
+	static void EmitRotationStep(const RotaryUpdate &update);
 	static void AccelPollEventHandler();
 	static void SensorUpdateEventHandler();
 

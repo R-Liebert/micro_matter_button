@@ -51,12 +51,12 @@ The HolyIoT boards have no USB port. You flash them over SWD using a Raspberry P
 2. Download the [picoprobe UF2](https://github.com/raspberrypi/picoprobe/releases) and drag it onto the Pico — it will appear as a USB drive.
 3. Wire the Pico to the HolyIoT board's SWD pads through the PCB test clip:
 
-   | Pico Pin | HolyIoT Pad |
-   |----------|-------------|
-   | GP2 (SWCLK) | SWCLK |
-   | GP3 (SWDIO) | SWDIO |
-   | GND | GND |
-   | 3V3 | VCC (optional — or use the coin cell) |
+   | Pico Pin | Arduino Nano RP2040 Connect | HolyIoT Pad |
+   |----------|-----------------------------|-------------|
+   | GP2 (SWCLK) | D10 (GPIO 2) | SWCLK |
+   | GP3 (SWDIO) | D11 (GPIO 3) | SWDIO |
+   | GND | GND | GND |
+   | 3V3 | 3V3 | VCC (optional — or use the coin cell) |
 
 <!-- INSERT PICTURE: PCB test clip attached to HolyIoT board sitting in 3D-printed programming jig, wired to Pico -->
 
@@ -89,44 +89,74 @@ Open your smart home app and add a new Matter device. Use the QR code or manual 
 
 ---
 
-## Operating Modes
+## Operating Modes & Wake-on-Turn Dimming
 
-Two firmware operating modes are available. Choose at flash time — no recompilation needed, just pick the right binary.
+When mounted **vertically on a wall**, the LIS2DH12 accelerometer stays in a **10 Hz Low-Power Wake-on-Turn mode (~3 µA)** with its high-pass motion interrupt (`INT1`) enabled.
+- **No double-tap needed:** Simply turn the knob on the wall—`INT1` wakes the MCU immediately and streams live relative brightness steps every 150 ms while you rotate.
+- After 2.5 seconds of inactivity, the accelerometer returns to 10 Hz low-power sleep automatically.
 
-### Mode 1 — Dimmable Switch
+### Home Assistant Integration (Endpoint 2 — Generic Switch Events)
 
-> ⚠️ **This mode requires Matter binding to work.** After commissioning, you must bind the button to a light using your smart home hub. Without a binding, button presses are silently ignored. See [Setting Up Binding](#setting-up-binding-mode-1-only) below.
+Both Mode 1 and Mode 2 expose **Endpoint 2 (`Switch` cluster)** to Home Assistant so you can control any Home Assistant light (such as a **Gledopto** controller, Zigbee/Wi-Fi bulb, or light group) while keeping full state overview in Home Assistant:
 
-This mode acts as a **Dimmable Light Switch** (Matter Light Switch device type). Commands are sent directly to bound lights over the Thread network.
+| Gesture | Home Assistant `event_type` | Event Attribute | Action |
+|---------|----------------------------|-----------------|--------|
+| Short press | `short_release` | `previous_position: 1` | Toggle light on/off |
+| Turn clockwise (brighten) | `long_press` | `new_position: 1..100` (step %) | Step brightness **up** by `new_position` % |
+| Turn counter-clockwise (dim) | `long_release` | `previous_position: 1..100` (step %) | Step brightness **down** by `previous_position` % |
 
-| Gesture | Action |
-|---------|--------|
-| Short press (< 400 ms) | Toggle the bound light on/off |
-| Long press (hold > 500 ms) | Cycle brightness from 0% → 100% while held |
-| Double-tap (two presses within 400 ms) | Wake the accelerometer and enter rotational dimming mode |
-| Rotate while in dimming mode | Adjust brightness proportionally to the rotation angle |
-| Tilt horizontally | Exit dimming mode and lock current brightness |
+#### Example Home Assistant Automation (Gledopto / Any HA Light)
 
-Rotational dimming activates for up to **10 seconds** after a double-tap. If no movement is detected for **3 seconds** during dimming, the accelerometer powers back down automatically to save battery.
-
-**Best used with:** Home Assistant, or any Matter hub that supports binding.
+```yaml
+alias: "Micro Matter Button - Control Gledopto Light"
+mode: queued
+max: 20
+trigger:
+  - platform: state
+    entity_id: event.matter_light_switch_button
+    not_from:
+      - unavailable
+      - unknown
+action:
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: event.matter_light_switch_button
+            state: "short_release"
+        sequence:
+          - action: light.toggle
+            target:
+              entity_id: light.gledopto
+      - conditions:
+          - condition: state
+            entity_id: event.matter_light_switch_button
+            state: "long_press"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: light.gledopto
+            data:
+              brightness_step_pct: "{{ state_attr('event.matter_light_switch_button', 'new_position') | int(10) }}"
+              transition: 0.2
+      - conditions:
+          - condition: state
+            entity_id: event.matter_light_switch_button
+            state: "long_release"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: light.gledopto
+            data:
+              brightness_step_pct: "-{{ state_attr('event.matter_light_switch_button', 'previous_position') | int(10) }}"
+              transition: 0.2
+```
 
 ---
 
-### Mode 2 — Generic Switch
+### Mode 1 vs. Mode 2
 
-> ✅ **No binding required.** This mode works out of the box with Apple Home, Google Home, Amazon Alexa, Home Assistant, and any other Matter-certified platform.
-
-This mode exposes a **Generic Switch** (Matter Generic Switch device type) on endpoint 2. Your smart home platform receives the button events and you configure what happens via automations.
-
-| Gesture | Matter Event |
-|---------|-------------|
-| Short press | `ShortRelease` |
-| Long press (hold > 500 ms) | `LongPress` → `LongRelease` on release |
-
-Use your platform's automation builder to trigger any action — turn on a light, run a scene, send a notification, or anything else your hub supports.
-
-**Works with:** Apple Home, Google Home, Amazon Alexa, Home Assistant, Samsung SmartThings, and any Matter-compatible hub.
+- **Mode 1 (`om1`):** Enables **both** Endpoint 2 (Home Assistant `Switch` events above) **and** Endpoint 1 (`LightSwitch` Matter Binding client using relative `StepWithOnOff` commands).
+- **Mode 2 (`om2`):** Enables Endpoint 2 (Home Assistant `Switch` events with rotational dimming) and disables Endpoint 1 for hubs that prefer a pure Generic Switch device.
 
 ---
 

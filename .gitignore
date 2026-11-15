@@ -8,3 +8,7 @@
 .DS_Store
 
 .cache/
+.pytest_cache/
+__pycache__/
+*.pyc
+/dist/
