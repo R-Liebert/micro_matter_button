@@ -14,6 +14,7 @@ void RotaryDimmer::ResetOnWake()
 {
 	mFirstSampleAfterWake = true;
 	mPendingAngleDelta = 0.0;
+	mSwipeArmed = true;
 }
 
 double RotaryDimmer::NormalizeAngle(double angleRad)
@@ -63,6 +64,91 @@ RotaryUpdate RotaryDimmer::ProcessSample(double x, double y, double z, uint32_t 
 	update.mode = mControlMode;
 	update.targetLevel = static_cast<uint8_t>(std::round(mAccumulatedBrightness));
 
+	double totalNorm = std::sqrt((x * x) + (y * y) + (z * z));
+	double currentAngle = std::atan2(y, x);
+
+	if (mFirstSampleAfterWake) {
+		mLastAngle = currentAngle;
+		mFirstSampleAfterWake = false;
+		mPendingAngleDelta = 0.0;
+		mLastMovementTimeMs = nowMs;
+		mLastSendTimeMs = nowMs;
+		if (totalNorm >= 7.0 && totalNorm <= 12.5) {
+			mGravityX = x;
+			mGravityY = y;
+			mGravityZ = z;
+			return update;
+		}
+	}
+
+	/* Decompose 3D linear acceleration relative to the tracked upward gravity vector */
+	double gNorm = std::sqrt((mGravityX * mGravityX) + (mGravityY * mGravityY) + (mGravityZ * mGravityZ));
+	double linX = x - mGravityX;
+	double linY = y - mGravityY;
+	double linZ = z - mGravityZ;
+	double aVert = 0.0;
+	double aHoriz = 0.0;
+
+	if (gNorm >= 3.0) {
+		double ux = mGravityX / gNorm;
+		double uy = mGravityY / gNorm;
+		double uz = mGravityZ / gNorm;
+		aVert = (linX * ux) + (linY * uy) + (linZ * uz);
+		double hx = linX - (aVert * ux);
+		double hy = linY - (aVert * uy);
+		double hz = linZ - (aVert * uz);
+		aHoriz = std::sqrt((hx * hx) + (hy * hy) + (hz * hz));
+	}
+
+	bool hasLinearImpulse = (totalNorm >= 2.8) && (std::abs(totalNorm - kStandardGravity) >= 0.8);
+
+	/* Check for 3D linear swipe gesture (Up, Down, or Horizontal) when linear impulse is present */
+	if (hasLinearImpulse && nowMs >= mSwipeCooldownUntilMs && mSwipeArmed) {
+		if (std::abs(aVert) >= kSwipeAccelThreshold && std::abs(aVert) >= aHoriz) {
+			update.swipe = (aVert > 0.0) ? SwipeGesture::Up : SwipeGesture::Down;
+			update.encodedPosition =
+				(aVert > 0.0) ? kShutterUpPosition : kShutterDownPosition;
+		} else if (aHoriz >= kSwipeAccelThreshold && aHoriz > std::abs(aVert)) {
+			update.swipe = SwipeGesture::Horizontal;
+			update.encodedPosition = kShutterStopPosition;
+		}
+
+		if (update.swipe != SwipeGesture::None) {
+			update.movementDetected = true;
+			mSwipeCooldownUntilMs = nowMs + kSwipeCooldownMs;
+			mSwipeArmed = false;
+			mPendingAngleDelta = 0.0;
+			mLastAngle = currentAngle;
+			mLastMovementTimeMs = nowMs;
+			return update;
+		}
+	}
+
+	/* Update gravity vector when in 1g condition (no linear acceleration) */
+	if (!hasLinearImpulse) {
+		mGravityX = x;
+		mGravityY = y;
+		mGravityZ = z;
+		if (nowMs >= mSwipeCooldownUntilMs) {
+			mSwipeArmed = true;
+		}
+	} else if (std::abs(totalNorm - kStandardGravity) < kLinearRestThreshold) {
+		constexpr double kAlpha = 0.25;
+		mGravityX = ((1.0 - kAlpha) * mGravityX) + (kAlpha * x);
+		mGravityY = ((1.0 - kAlpha) * mGravityY) + (kAlpha * y);
+		mGravityZ = ((1.0 - kAlpha) * mGravityZ) + (kAlpha * z);
+		if (nowMs >= mSwipeCooldownUntilMs) {
+			mSwipeArmed = true;
+		}
+	}
+
+	/* Suppress rotary dimming while in swipe cooldown or experiencing linear acceleration */
+	if (nowMs < mSwipeCooldownUntilMs || std::abs(totalNorm - kStandardGravity) >= 2.5) {
+		mLastAngle = currentAngle;
+		mPendingAngleDelta = 0.0;
+		return update;
+	}
+
 	if (std::abs(z) > kHorizontalZLimit) {
 		if (std::abs(mPendingAngleDelta) >= kSettleStepAngleRad) {
 			FlushPendingDelta(nowMs, update);
@@ -72,20 +158,9 @@ RotaryUpdate RotaryDimmer::ProcessSample(double x, double y, double z, uint32_t 
 	}
 
 	double magnitudeSq = (x * x) + (y * y);
-	double currentAngle = std::atan2(y, x);
-
 	if (magnitudeSq < kMinXYMagnitudeSq) {
 		mLastAngle = currentAngle;
 		mLastMovementTimeMs = nowMs;
-		return update;
-	}
-
-	if (mFirstSampleAfterWake) {
-		mLastAngle = currentAngle;
-		mFirstSampleAfterWake = false;
-		mPendingAngleDelta = 0.0;
-		mLastMovementTimeMs = nowMs;
-		mLastSendTimeMs = nowMs;
 		return update;
 	}
 

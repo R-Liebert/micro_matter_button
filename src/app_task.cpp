@@ -105,8 +105,8 @@ constexpr EndpointId kTempEndpointId = 3;
 constexpr EndpointId kHumEndpointId = 4;
 constexpr EndpointId kPressureEndpointId = 5;
 
-/* Accelerometer rotational dimming */
-constexpr uint32_t kAccelPollIntervalMs = 50;
+/* Accelerometer rotational dimming & 3D swipe detection */
+constexpr uint32_t kAccelPollIntervalMs = 30;
 constexpr uint32_t kDoubleTapWindowMs = 350;
 constexpr uint32_t kColorTempWakeDurationMs = 6000;
 constexpr uint32_t kRotationWakeExtensionMs = 2500;
@@ -220,7 +220,7 @@ void AppTask::EnterAccelIdleMode()
 	 * - CTRL_REG5 (0x24) = 0x00: Non-latched INT1
 	 * - INT1_THS  (0x32) = 0x06: ~96 mg threshold (~6 deg rotation on vertical wall)
 	 * - INT1_DUR  (0x33) = 0x00: Immediate trigger
-	 * - INT1_CFG  (0x30) = 0x0A: XHIE | YHIE (wake on X or Y gravity shift)
+	 * - INT1_CFG  (0x30) = 0x2A: ZHIE | YHIE | XHIE (wake on rotation or wall removal/swipe)
 	 */
 	WriteAccelRegister(0x20, 0x2F);
 	WriteAccelRegister(0x21, 0x01);
@@ -229,7 +229,7 @@ void AppTask::EnterAccelIdleMode()
 	WriteAccelRegister(0x24, 0x00);
 	WriteAccelRegister(0x32, 0x06);
 	WriteAccelRegister(0x33, 0x00);
-	WriteAccelRegister(0x30, 0x0A);
+	WriteAccelRegister(0x30, 0x2A);
 
 	/* Dummy-read REFERENCE (0x26) to zero the high-pass filter at the current resting angle */
 	(void)ReadAccelRegister(0x26);
@@ -269,6 +269,16 @@ void AppTask::StartAccelDimming()
 
 void AppTask::EmitRotationStep(const RotaryUpdate &update)
 {
+	if (update.swipe != SwipeGesture::None) {
+		Server::GetInstance().GetICDManager().OnNetworkActivity();
+		uint8_t pos = update.encodedPosition;
+		LOG_INF("Shutter swipe detected (gesture=%u, pos=%u)",
+			static_cast<uint8_t>(update.swipe), pos);
+		chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, pos);
+		chip::app::Clusters::SwitchServer::Instance().OnShortRelease(kGenericSwitchEndpointId, pos);
+		return;
+	}
+
 	if (!update.hasStep || update.stepPercent == 0) {
 		return;
 	}
@@ -385,13 +395,8 @@ void AppTask::AccelPollEventHandler()
 		Instance().StartTimer(Timer::AccelSleep, kRotationWakeExtensionMs);
 	}
 
-	if (update.hasStep) {
+	if (update.swipe != SwipeGesture::None || update.hasStep) {
 		EmitRotationStep(update);
-	}
-
-	if (update.stopDimming) {
-		LOG_INF("Horizontal tilt — returning accelerometer to idle wake-on-turn mode.");
-		EnterAccelIdleMode();
 	}
 }
 
@@ -757,10 +762,11 @@ CHIP_ERROR AppTask::Init()
 	}
 
 	/* Configure Endpoint 2 Switch cluster:
-	 * Positions 1..100  = Brightness step %
+	 * Positions 1..100   = Brightness step %
 	 * Positions 101..200 = Color Temperature step % (100 + step_pct)
+	 * Positions 201..203 = Roller Shutter Swipe (201 = Up, 202 = Down, 203 = Stop)
 	 */
-	chip::app::Clusters::Switch::Attributes::NumberOfPositions::Set(kGenericSwitchEndpointId, 200);
+	chip::app::Clusters::Switch::Attributes::NumberOfPositions::Set(kGenericSwitchEndpointId, 205);
 	chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, 0);
 
 #ifdef CONFIG_MATTER_BUTTON_MODE_2

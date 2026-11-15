@@ -1,4 +1,4 @@
-"""Unit tests for the C++ RotaryDimmer engine and firmware configuration."""
+"""Unit tests for the C++ RotaryDimmer engine, 3D swipe gestures, and firmware configuration."""
 
 import ctypes
 import math
@@ -18,6 +18,7 @@ class RotaryUpdateC(ctypes.Structure):
         ("stopDimming", ctypes.c_bool),
         ("movementDetected", ctypes.c_bool),
         ("mode", ctypes.c_uint8),
+        ("swipe", ctypes.c_uint8),
         ("stepPercent", ctypes.c_int8),
         ("encodedPosition", ctypes.c_uint8),
         ("stepLevel", ctypes.c_int16),
@@ -121,6 +122,7 @@ def test_wake_baseline_does_not_emit_step(dimmer: RotaryDimmerWrapper) -> None:
     assert not res.hasStep
     assert not res.stopDimming
     assert not res.movementDetected
+    assert res.swipe == 0
 
 
 def test_live_updates_emitted_while_turning_clockwise(dimmer: RotaryDimmerWrapper) -> None:
@@ -181,6 +183,55 @@ def test_color_temperature_mode_encodes_positions_101_to_200(dimmer: RotaryDimme
     assert res_cw.targetLevel == initial_brightness
 
 
+def test_swipe_up_triggers_shutter_up_and_ignores_braking_rebound(
+    dimmer: RotaryDimmerWrapper,
+) -> None:
+    """Verify upward vertical swipe triggers SwipeGesture::Up (201) and ignores braking rebound."""
+    dimmer.process(x=9.81, y=0.0, z=0.0, now_ms=0)
+
+    res_up = dimmer.process(x=15.5, y=0.5, z=0.2, now_ms=30)
+    assert res_up.swipe == 1
+    assert res_up.encodedPosition == 201
+    assert not res_up.hasStep
+
+    res_brake = dimmer.process(x=3.5, y=0.2, z=0.0, now_ms=150)
+    assert res_brake.swipe == 0
+    assert not res_brake.hasStep
+
+
+def test_swipe_down_triggers_shutter_down_and_ignores_braking_rebound(
+    dimmer: RotaryDimmerWrapper,
+) -> None:
+    """Verify downward vertical swipe triggers SwipeGesture::Down (202) and ignores braking rebound."""
+    dimmer.process(x=9.81, y=0.0, z=0.0, now_ms=0)
+
+    res_down = dimmer.process(x=3.8, y=0.2, z=-0.1, now_ms=30)
+    assert res_down.swipe == 2
+    assert res_down.encodedPosition == 202
+    assert not res_down.hasStep
+
+    res_brake = dimmer.process(x=15.8, y=0.0, z=0.0, now_ms=150)
+    assert res_brake.swipe == 0
+    assert not res_brake.hasStep
+
+
+def test_swipe_horizontal_in_any_direction_triggers_shutter_stop(
+    dimmer: RotaryDimmerWrapper,
+) -> None:
+    """Verify horizontal swipe in any direction triggers SwipeGesture::Horizontal (203)."""
+    dimmer.process(x=0.0, y=9.81, z=0.0, now_ms=0)
+
+    res_left = dimmer.process(x=5.5, y=9.81, z=1.0, now_ms=30)
+    assert res_left.swipe == 3
+    assert res_left.encodedPosition == 203
+    assert not res_left.hasStep
+
+    dimmer.process(x=0.0, y=9.81, z=0.0, now_ms=700)
+    res_depth = dimmer.process(x=-1.0, y=9.81, z=-5.5, now_ms=730)
+    assert res_depth.swipe == 3
+    assert res_depth.encodedPosition == 203
+
+
 def test_settle_flushes_residual_rotation(dimmer: RotaryDimmerWrapper) -> None:
     """Verify a small sub-interval rotation is flushed once movement settles for 150ms."""
     dimmer.process_angle_deg(0.0, now_ms=0)
@@ -219,11 +270,11 @@ def test_noise_deadband_rejection(dimmer: RotaryDimmerWrapper) -> None:
 
 
 def test_horizontal_tilt_stops_dimming_and_flushes(dimmer: RotaryDimmerWrapper) -> None:
-    """Verify tilting the board flat (|z| > 7.5 m/s^2) flushes pending delta and stops dimming."""
+    """Verify tilting the board flat (|z| > 7.5 m/s^2) at 1g flushes pending delta and pauses rotary dimming."""
     dimmer.process_angle_deg(0.0, now_ms=0)
     dimmer.process_angle_deg(7.0, now_ms=50)
 
-    res = dimmer.process(x=1.0, y=1.0, z=9.2, now_ms=100)
+    res = dimmer.process(x=1.0, y=1.0, z=9.7, now_ms=100)
     assert res.stopDimming
     assert res.hasStep
     assert res.stepPercent > 0
@@ -251,6 +302,7 @@ def test_firmware_and_ci_configuration() -> None:
     assert "StartAccelDimming" in app_task
     assert "EmitRotationStep" in app_task
     assert "RotaryControlMode::ColorTemp" in app_task
+    assert "SwipeGesture::None" in app_task
 
     workflow = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text()
     assert "micro_matter_button_h25015_om1.hex" in workflow

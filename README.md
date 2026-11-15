@@ -106,13 +106,16 @@ Both Mode 1 and Mode 2 expose **Endpoint 2 (`Switch` cluster)** to Home Assistan
 | Turn counter-clockwise (default) | `long_release` | `previous_position: 1..100` | Step **brightness down** by `previous_position` % |
 | **Double-click** + turn clockwise | `long_press` | `new_position: 101..200` | Step **color temperature cooler (K)** by `(new_position - 100)` % |
 | **Double-click** + turn counter-clockwise | `long_release` | `previous_position: 101..200` | Step **color temperature warmer (K)** by `(previous_position - 100)` % |
+| **Swipe vertically UP** (in hand) | `short_release` | `previous_position: 201` | **Open / raise** roller shutters (`cover.open_cover`) |
+| **Swipe vertically DOWN** (in hand) | `short_release` | `previous_position: 202` | **Close / lower** roller shutters (`cover.close_cover`) |
+| **Swipe HORIZONTALLY** (any direction) | `short_release` | `previous_position: 203` | **Stop** roller shutters (`cover.stop_cover`) |
 
-*(After double-clicking and adjusting color temperature, stopping rotation for 2.5 seconds automatically returns the knob to Brightness mode for the next turn.)*
+*(After double-clicking and adjusting color temperature, stopping rotation for 2.5 seconds automatically returns the knob to Brightness mode for the next turn. Linear swipes use 3D gravity projection so they work regardless of how the round magnetic button is rotated in your hand.)*
 
-#### Example Home Assistant Automation (Gledopto / Any HA Light — Brightness + Color Temp)
+#### Example Home Assistant Automation (Gledopto Light + Roller Shutters)
 
 ```yaml
-alias: "Micro Matter Button - Control Gledopto Light"
+alias: "Micro Matter Button - Gledopto Light & Roller Shutters"
 mode: queued
 max: 20
 trigger:
@@ -125,8 +128,8 @@ variables:
   ev_type: "{{ states('event.matter_light_switch_button') }}"
   raw_pos: >-
     {{ state_attr('event.matter_light_switch_button',
-       'new_position' if ev_type == 'long_press' else 'previous_position') | int(10) }}
-  is_color_temp: "{{ raw_pos > 100 }}"
+       'new_position' if ev_type == 'long_press' else 'previous_position') | int(1) }}
+  is_color_temp: "{{ 101 <= raw_pos <= 200 }}"
   step_pct: "{{ (raw_pos - 100) if is_color_temp else raw_pos }}"
   signed_pct: "{{ step_pct if ev_type == 'long_press' else -step_pct }}"
   min_k: "{{ state_attr('light.gledopto', 'min_color_temp_kelvin') | int(2000) }}"
@@ -134,13 +137,43 @@ variables:
   cur_k: "{{ state_attr('light.gledopto', 'color_temp_kelvin') | int(3500) }}"
 action:
   - choose:
+      # 1. Single click -> Toggle light
       - conditions:
           - condition: template
-            value_template: "{{ ev_type == 'short_release' }}"
+            value_template: "{{ ev_type == 'short_release' and raw_pos == 1 }}"
         sequence:
           - action: light.toggle
             target:
               entity_id: light.gledopto
+
+      # 2. Swipe UP -> Open roller shutters
+      - conditions:
+          - condition: template
+            value_template: "{{ ev_type == 'short_release' and raw_pos == 201 }}"
+        sequence:
+          - action: cover.open_cover
+            target:
+              entity_id: cover.roller_shutters
+
+      # 3. Swipe DOWN -> Close roller shutters
+      - conditions:
+          - condition: template
+            value_template: "{{ ev_type == 'short_release' and raw_pos == 202 }}"
+        sequence:
+          - action: cover.close_cover
+            target:
+              entity_id: cover.roller_shutters
+
+      # 4. Swipe HORIZONTAL (any direction) -> Stop roller shutters
+      - conditions:
+          - condition: template
+            value_template: "{{ ev_type == 'short_release' and raw_pos == 203 }}"
+        sequence:
+          - action: cover.stop_cover
+            target:
+              entity_id: cover.roller_shutters
+
+      # 5. Rotate (default) -> Step Brightness
       - conditions:
           - condition: template
             value_template: "{{ ev_type in ['long_press', 'long_release'] and not is_color_temp }}"
@@ -151,6 +184,8 @@ action:
             data:
               brightness_step_pct: "{{ signed_pct }}"
               transition: 0.2
+
+      # 6. Double-click + Rotate -> Step Color Temperature (Kelvin)
       - conditions:
           - condition: template
             value_template: "{{ ev_type in ['long_press', 'long_release'] and is_color_temp }}"

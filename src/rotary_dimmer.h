@@ -19,20 +19,35 @@ enum class RotaryControlMode : uint8_t {
 };
 
 /**
- * @brief Result of processing a single 3-axis accelerometer sample during rotational dimming.
+ * @brief Linear 3D swipe gesture for roller shutter control when removed from the wall.
+ */
+enum class SwipeGesture : uint8_t {
+	None = 0,
+	/** Vertical upward swipe -> Open / raise roller shutters (position 201). */
+	Up = 1,
+	/** Vertical downward swipe -> Close / lower roller shutters (position 202). */
+	Down = 2,
+	/** Horizontal swipe in any direction -> Stop roller shutters (position 203). */
+	Horizontal = 3,
+};
+
+/**
+ * @brief Result of processing a single 3-axis accelerometer sample.
  */
 struct RotaryUpdate {
-	/** True if a step should be transmitted immediately. */
+	/** True if a rotary step should be transmitted immediately. */
 	bool hasStep = false;
-	/** True if the board was tilted flat/horizontally and dimming should stop. */
+	/** True if the board was tilted flat/horizontally and rotary dimming is paused. */
 	bool stopDimming = false;
-	/** True if rotational movement above the noise floor was detected on this sample. */
+	/** True if rotational or linear movement above the noise floor was detected. */
 	bool movementDetected = false;
-	/** Active control mode (Brightness or ColorTemp) for this update. */
+	/** Active rotary control mode (Brightness or ColorTemp). */
 	RotaryControlMode mode = RotaryControlMode::Brightness;
-	/** Signed relative change in percent (-100 to +100). */
+	/** Detected linear swipe gesture (None, Up, Down, or Horizontal). */
+	SwipeGesture swipe = SwipeGesture::None;
+	/** Signed relative rotary change in percent (-100 to +100). */
 	int8_t stepPercent = 0;
-	/** Encoded Switch cluster position: 1..100 for Brightness, 101..200 for ColorTemp. */
+	/** Encoded Switch cluster position: 1..100 Brightness, 101..200 ColorTemp, 201..203 Shutter Swipe. */
 	uint8_t encodedPosition = 0;
 	/** Signed relative change in Matter LevelControl units (-254 to +254). */
 	int16_t stepLevel = 0;
@@ -41,14 +56,17 @@ struct RotaryUpdate {
 };
 
 /**
- * @brief Stateful rotational dimming calculator for a vertically mounted 3-axis accelerometer.
+ * @brief Stateful rotational dimmer and 3D linear swipe detector for a 3-axis accelerometer.
  *
  * Converts gravity vector rotation in the X-Y plane into live, rate-limited relative
- * and absolute updates for both brightness and color temperature control.
+ * updates for brightness/color-temperature, and decomposes 3D linear acceleration
+ * relative to the tracked gravity vector to detect orientation-independent Up, Down,
+ * and Horizontal swipe gestures for roller shutters.
  */
 class RotaryDimmer {
 public:
 	static constexpr double kPi = 3.14159265358979323846;
+	static constexpr double kStandardGravity = 9.81;
 	/** Z-axis threshold (m/s^2) above which the button is considered horizontal/flat. */
 	static constexpr double kHorizontalZLimit = 7.5;
 	/** Minimum squared magnitude (m^2/s^4) in the X-Y plane required for reliable angle calculation. */
@@ -68,18 +86,32 @@ public:
 	/** Offset added to Switch cluster position when in ColorTemp mode (101..200). */
 	static constexpr uint8_t kColorTempPositionOffset = 100;
 
+	/** Linear acceleration threshold (m/s^2) to trigger a vertical or horizontal swipe. */
+	static constexpr double kSwipeAccelThreshold = 4.5;
+	/** Linear acceleration threshold (m/s^2) below which gravity low-pass filter updates and swipe re-arms. */
+	static constexpr double kLinearRestThreshold = 2.0;
+	/** Cooldown window (ms) after a swipe to reject braking/deceleration rebound spikes. */
+	static constexpr uint32_t kSwipeCooldownMs = 600;
+
+	/** Switch cluster position emitted on a vertical upward swipe (Shutters Up). */
+	static constexpr uint8_t kShutterUpPosition = 201;
+	/** Switch cluster position emitted on a vertical downward swipe (Shutters Down). */
+	static constexpr uint8_t kShutterDownPosition = 202;
+	/** Switch cluster position emitted on a horizontal swipe (Shutters Stop). */
+	static constexpr uint8_t kShutterStopPosition = 203;
+
 	/**
-	 * @brief Reset the angle baseline when waking the accelerometer for a rotation session.
+	 * @brief Reset the angle baseline when waking the accelerometer for a new session.
 	 */
 	void ResetOnWake();
 
 	/**
-	 * @brief Set the active control mode (Brightness or ColorTemp).
+	 * @brief Set the active rotary control mode (Brightness or ColorTemp).
 	 */
 	void SetControlMode(RotaryControlMode mode) { mControlMode = mode; }
 
 	/**
-	 * @brief Get the active control mode (Brightness or ColorTemp).
+	 * @brief Get the active rotary control mode (Brightness or ColorTemp).
 	 */
 	RotaryControlMode GetControlMode() const { return mControlMode; }
 
@@ -90,7 +122,7 @@ public:
 	 * @param y Y-axis acceleration in m/s^2.
 	 * @param z Z-axis acceleration in m/s^2.
 	 * @param nowMs Monotonic system uptime in milliseconds.
-	 * @return RotaryUpdate describing whether to send a step, extend wake, or stop.
+	 * @return RotaryUpdate describing any rotary step or linear swipe gesture.
 	 */
 	RotaryUpdate ProcessSample(double x, double y, double z, uint32_t nowMs);
 
@@ -106,7 +138,7 @@ private:
 	static double NormalizeAngle(double angleRad);
 
 	/**
-	 * @brief Populate step fields in outUpdate from mPendingAngleDelta and clear pending delta.
+	 * @brief Populate rotary step fields in outUpdate from mPendingAngleDelta and clear pending delta.
 	 */
 	void FlushPendingDelta(uint32_t nowMs, RotaryUpdate &outUpdate);
 
@@ -114,7 +146,12 @@ private:
 	double mLastAngle = 0.0;
 	double mPendingAngleDelta = 0.0;
 	double mAccumulatedBrightness = 127.0;
+	double mGravityX = kStandardGravity;
+	double mGravityY = 0.0;
+	double mGravityZ = 0.0;
 	uint32_t mLastMovementTimeMs = 0;
 	uint32_t mLastSendTimeMs = 0;
+	uint32_t mSwipeCooldownUntilMs = 0;
 	bool mFirstSampleAfterWake = true;
+	bool mSwipeArmed = true;
 };
