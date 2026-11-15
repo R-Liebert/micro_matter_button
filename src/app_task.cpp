@@ -107,6 +107,8 @@ constexpr EndpointId kPressureEndpointId = 5;
 
 /* Accelerometer rotational dimming */
 constexpr uint32_t kAccelPollIntervalMs = 50;
+constexpr uint32_t kDoubleTapWindowMs = 350;
+constexpr uint32_t kColorTempWakeDurationMs = 6000;
 constexpr uint32_t kRotationWakeExtensionMs = 2500;
 
 /* GPIO long-press dimming */
@@ -140,12 +142,15 @@ k_timer sSensorPollTimer;
 
 Nrf::Matter::IdentifyCluster sIdentifyCluster(kLightEndpointId);
 
-/* --- Accelerometer & dimming state --- */
+/* --- Accelerometer & button state --- */
 const struct device *sAccelDevice = nullptr;
 RotaryDimmer sRotaryDimmer;
 bool sAccelPollingActive = false;
 bool sAccelInt1Ready = false;
 bool sDimmerTriggered = false;
+bool sSingleTapFired = false;
+bool sDoubleTapHandled = false;
+uint32_t sLastButtonPressTime = 0;
 
 /* --- Factory reset state --- */
 bool sInFactoryWarning = false;
@@ -172,6 +177,16 @@ bool sIsSensorTimerStarted = false;
 #ifdef CONFIG_CHIP_ICD_UAT_SUPPORT
 #define UAT_BUTTON_MASK DK_BTN3_MSK
 #endif
+
+void TriggerShortPressToggle()
+{
+	LOG_INF("Single tap — toggling light.");
+	chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, 0);
+	chip::app::Clusters::SwitchServer::Instance().OnShortRelease(kGenericSwitchEndpointId, 1);
+#ifdef CONFIG_MATTER_BUTTON_MODE_1
+	LightSwitch::GetInstance().InitiateActionSwitch(LightSwitch::Action::Toggle);
+#endif
+}
 } /* namespace */
 
 /* --- Accelerometer Wake-on-Turn Interrupt -------------------------------- */
@@ -189,6 +204,7 @@ static void AccelInt1Isr(const struct device *port, struct gpio_callback *cb, gp
 void AppTask::EnterAccelIdleMode()
 {
 	sAccelPollingActive = false;
+	sRotaryDimmer.SetControlMode(RotaryControlMode::Brightness);
 	Instance().CancelTimer(Timer::AccelPoll);
 	Instance().CancelTimer(Timer::AccelSleep);
 
@@ -235,7 +251,8 @@ void AppTask::StartAccelDimming()
 	}
 
 	if (!sAccelPollingActive) {
-		LOG_INF("Wake-on-turn triggered — starting active rotation tracking.");
+		LOG_INF("Starting active rotation tracking (mode=%u).",
+			static_cast<uint8_t>(sRotaryDimmer.GetControlMode()));
 		/* CTRL_REG1 (0x20) = 0x57: 100Hz Normal mode, Z/Y/X enabled */
 		WriteAccelRegister(0x20, 0x57);
 		sRotaryDimmer.ResetOnWake();
@@ -244,7 +261,10 @@ void AppTask::StartAccelDimming()
 	}
 
 	Server::GetInstance().GetICDManager().OnNetworkActivity();
-	Instance().StartTimer(Timer::AccelSleep, kRotationWakeExtensionMs);
+	uint32_t timeoutMs = (sRotaryDimmer.GetControlMode() == RotaryControlMode::ColorTemp)
+				     ? kColorTempWakeDurationMs
+				     : kRotationWakeExtensionMs;
+	Instance().StartTimer(Timer::AccelSleep, timeoutMs);
 }
 
 void AppTask::EmitRotationStep(const RotaryUpdate &update)
@@ -255,19 +275,23 @@ void AppTask::EmitRotationStep(const RotaryUpdate &update)
 
 	Server::GetInstance().GetICDManager().OnNetworkActivity();
 
-	uint8_t stepPct = static_cast<uint8_t>(std::clamp<int>(std::abs(update.stepPercent), 1, 100));
-	chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, stepPct);
+	uint8_t pos = update.encodedPosition;
+	chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, pos);
 
 	if (update.stepPercent > 0) {
-		LOG_INF("Rotate CW: +%u%% (level +%d)", stepPct, update.stepLevel);
-		chip::app::Clusters::SwitchServer::Instance().OnLongPress(kGenericSwitchEndpointId, stepPct);
+		LOG_INF("Rotate CW (mode=%u): pos=%u (+%d%%)",
+			static_cast<uint8_t>(update.mode), pos, update.stepPercent);
+		chip::app::Clusters::SwitchServer::Instance().OnLongPress(kGenericSwitchEndpointId, pos);
 	} else {
-		LOG_INF("Rotate CCW: -%u%% (level %d)", stepPct, update.stepLevel);
-		chip::app::Clusters::SwitchServer::Instance().OnLongRelease(kGenericSwitchEndpointId, stepPct);
+		LOG_INF("Rotate CCW (mode=%u): pos=%u (%d%%)",
+			static_cast<uint8_t>(update.mode), pos, update.stepPercent);
+		chip::app::Clusters::SwitchServer::Instance().OnLongRelease(kGenericSwitchEndpointId, pos);
 	}
 
 #ifdef CONFIG_MATTER_BUTTON_MODE_1
-	LightSwitch::GetInstance().StepBrightness(update.stepLevel);
+	if (update.mode == RotaryControlMode::Brightness) {
+		LightSwitch::GetInstance().StepBrightness(update.stepLevel);
+	}
 #endif
 }
 
@@ -405,6 +429,11 @@ void AppTask::TimerEventHandler(const Timer &timerType)
 {
 	switch (timerType) {
 	case Timer::SingleTap:
+		/* Fire toggle if the button was already released and no second tap arrived */
+		if (!(dk_get_buttons() & APPLICATION_BUTTON_MASK) && !sDimmerTriggered && !sDoubleTapHandled) {
+			sSingleTapFired = true;
+			TriggerShortPressToggle();
+		}
 		break;
 
 	case Timer::AccelPoll:
@@ -417,6 +446,7 @@ void AppTask::TimerEventHandler(const Timer &timerType)
 		break;
 
 	case Timer::DimmerTrigger:
+		Instance().CancelTimer(Timer::SingleTap);
 		sDimmerTriggered = true;
 #ifdef CONFIG_MATTER_BUTTON_MODE_1
 		LOG_INF("Long press — starting bound brightness cycle.");
@@ -502,12 +532,28 @@ void AppTask::ButtonEventHandler(Nrf::ButtonState state, Nrf::ButtonMask hasChan
 			Instance().StartTimer(Timer::FactoryWarning, kFactoryResetWarningMs);
 			Instance().StartTimer(Timer::FactoryReset, kFactoryResetTriggerMs);
 
-			sDimmerTriggered = false;
-			StartAccelDimming();
-
-			chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, 1);
-			chip::app::Clusters::SwitchServer::Instance().OnInitialPress(kGenericSwitchEndpointId, 1);
-			Instance().StartTimer(Timer::DimmerTrigger, kDimmerTriggeredTimeout);
+			uint32_t now = k_uptime_get_32();
+			if ((now - sLastButtonPressTime) < kDoubleTapWindowMs) {
+				/* Double tap: switch rotary control to Color Temperature mode */
+				Instance().CancelTimer(Timer::SingleTap);
+				Instance().CancelTimer(Timer::DimmerTrigger);
+				sDoubleTapHandled = true;
+				sSingleTapFired = false;
+				LOG_INF("Double tap — entering Color Temperature rotary mode.");
+				sRotaryDimmer.SetControlMode(RotaryControlMode::ColorTemp);
+				sRotaryDimmer.ResetOnWake();
+				StartAccelDimming();
+			} else {
+				/* First press: wait for potential second tap or long press */
+				sDoubleTapHandled = false;
+				sSingleTapFired = false;
+				sDimmerTriggered = false;
+				chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, 1);
+				chip::app::Clusters::SwitchServer::Instance().OnInitialPress(kGenericSwitchEndpointId, 1);
+				Instance().StartTimer(Timer::SingleTap, kDoubleTapWindowMs);
+				Instance().StartTimer(Timer::DimmerTrigger, kDimmerTriggeredTimeout);
+			}
+			sLastButtonPressTime = now;
 		} else {
 			/* Button released */
 			Instance().CancelTimer(Timer::FactoryWarning);
@@ -524,17 +570,15 @@ void AppTask::ButtonEventHandler(Nrf::ButtonState state, Nrf::ButtonMask hasChan
 			}
 
 			Instance().CancelTimer(Timer::DimmerTrigger);
-			if (sDimmerTriggered) {
+			if (sDoubleTapHandled) {
+				sDoubleTapHandled = false;
+			} else if (sDimmerTriggered) {
 				Instance().CancelTimer(Timer::Dimmer);
 				sDimmerTriggered = false;
-			} else {
-				/* Short press: emit ShortRelease to Home Assistant and Toggle to bound lights */
-				LOG_INF("Short press — toggling light.");
-				chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, 0);
-				chip::app::Clusters::SwitchServer::Instance().OnShortRelease(kGenericSwitchEndpointId, 1);
-#ifdef CONFIG_MATTER_BUTTON_MODE_1
-				LightSwitch::GetInstance().InitiateActionSwitch(LightSwitch::Action::Toggle);
-#endif
+			} else if ((k_uptime_get_32() - sLastButtonPressTime) >= kDoubleTapWindowMs && !sSingleTapFired) {
+				/* Held past double-tap window (<500ms) and released: toggle now */
+				sSingleTapFired = true;
+				TriggerShortPressToggle();
 			}
 		}
 
@@ -712,8 +756,11 @@ CHIP_ERROR AppTask::Init()
 		return err;
 	}
 
-	/* Configure Endpoint 2 Switch cluster to support 0..100% step positions for Home Assistant */
-	chip::app::Clusters::Switch::Attributes::NumberOfPositions::Set(kGenericSwitchEndpointId, 100);
+	/* Configure Endpoint 2 Switch cluster:
+	 * Positions 1..100  = Brightness step %
+	 * Positions 101..200 = Color Temperature step % (100 + step_pct)
+	 */
+	chip::app::Clusters::Switch::Attributes::NumberOfPositions::Set(kGenericSwitchEndpointId, 200);
 	chip::app::Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, 0);
 
 #ifdef CONFIG_MATTER_BUTTON_MODE_2

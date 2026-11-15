@@ -33,6 +33,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/nrfconnect/sdk-nrf-toolchain:v3.2.4
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout application
         uses: actions/checkout@v4

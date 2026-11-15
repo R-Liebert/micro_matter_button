@@ -101,11 +101,15 @@ Both Mode 1 and Mode 2 expose **Endpoint 2 (`Switch` cluster)** to Home Assistan
 
 | Gesture | Home Assistant `event_type` | Event Attribute | Action |
 |---------|----------------------------|-----------------|--------|
-| Short press | `short_release` | `previous_position: 1` | Toggle light on/off |
-| Turn clockwise (brighten) | `long_press` | `new_position: 1..100` (step %) | Step brightness **up** by `new_position` % |
-| Turn counter-clockwise (dim) | `long_release` | `previous_position: 1..100` (step %) | Step brightness **down** by `previous_position` % |
+| Single click | `short_release` | `previous_position: 1` | Toggle light on/off |
+| Turn clockwise (default) | `long_press` | `new_position: 1..100` | Step **brightness up** by `new_position` % |
+| Turn counter-clockwise (default) | `long_release` | `previous_position: 1..100` | Step **brightness down** by `previous_position` % |
+| **Double-click** + turn clockwise | `long_press` | `new_position: 101..200` | Step **color temperature cooler (K)** by `(new_position - 100)` % |
+| **Double-click** + turn counter-clockwise | `long_release` | `previous_position: 101..200` | Step **color temperature warmer (K)** by `(previous_position - 100)` % |
 
-#### Example Home Assistant Automation (Gledopto / Any HA Light)
+*(After double-clicking and adjusting color temperature, stopping rotation for 2.5 seconds automatically returns the knob to Brightness mode for the next turn.)*
+
+#### Example Home Assistant Automation (Gledopto / Any HA Light — Brightness + Color Temp)
 
 ```yaml
 alias: "Micro Matter Button - Control Gledopto Light"
@@ -117,37 +121,46 @@ trigger:
     not_from:
       - unavailable
       - unknown
+variables:
+  ev_type: "{{ states('event.matter_light_switch_button') }}"
+  raw_pos: >-
+    {{ state_attr('event.matter_light_switch_button',
+       'new_position' if ev_type == 'long_press' else 'previous_position') | int(10) }}
+  is_color_temp: "{{ raw_pos > 100 }}"
+  step_pct: "{{ (raw_pos - 100) if is_color_temp else raw_pos }}"
+  signed_pct: "{{ step_pct if ev_type == 'long_press' else -step_pct }}"
+  min_k: "{{ state_attr('light.gledopto', 'min_color_temp_kelvin') | int(2000) }}"
+  max_k: "{{ state_attr('light.gledopto', 'max_color_temp_kelvin') | int(6500) }}"
+  cur_k: "{{ state_attr('light.gledopto', 'color_temp_kelvin') | int(3500) }}"
 action:
   - choose:
       - conditions:
-          - condition: state
-            entity_id: event.matter_light_switch_button
-            state: "short_release"
+          - condition: template
+            value_template: "{{ ev_type == 'short_release' }}"
         sequence:
           - action: light.toggle
             target:
               entity_id: light.gledopto
       - conditions:
-          - condition: state
-            entity_id: event.matter_light_switch_button
-            state: "long_press"
+          - condition: template
+            value_template: "{{ ev_type in ['long_press', 'long_release'] and not is_color_temp }}"
         sequence:
           - action: light.turn_on
             target:
               entity_id: light.gledopto
             data:
-              brightness_step_pct: "{{ state_attr('event.matter_light_switch_button', 'new_position') | int(10) }}"
+              brightness_step_pct: "{{ signed_pct }}"
               transition: 0.2
       - conditions:
-          - condition: state
-            entity_id: event.matter_light_switch_button
-            state: "long_release"
+          - condition: template
+            value_template: "{{ ev_type in ['long_press', 'long_release'] and is_color_temp }}"
         sequence:
           - action: light.turn_on
             target:
               entity_id: light.gledopto
             data:
-              brightness_step_pct: "-{{ state_attr('event.matter_light_switch_button', 'previous_position') | int(10) }}"
+              color_temp_kelvin: >-
+                {{ [max_k, [min_k, (cur_k + (signed_pct * (max_k - min_k) / 100)) | int] | max] | min }}
               transition: 0.2
 ```
 

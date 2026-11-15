@@ -17,7 +17,9 @@ class RotaryUpdateC(ctypes.Structure):
         ("hasStep", ctypes.c_bool),
         ("stopDimming", ctypes.c_bool),
         ("movementDetected", ctypes.c_bool),
+        ("mode", ctypes.c_uint8),
         ("stepPercent", ctypes.c_int8),
+        ("encodedPosition", ctypes.c_uint8),
         ("stepLevel", ctypes.c_int16),
         ("targetLevel", ctypes.c_uint8),
     ]
@@ -40,6 +42,10 @@ class RotaryDimmerWrapper:
     def reset(self) -> None:
         """Reset dimmer baseline state for a new wake-on-turn session."""
         self._lib.rotary_dimmer_reset(self._handle)
+
+    def set_mode(self, mode: int) -> None:
+        """Set control mode: 0 for Brightness, 1 for ColorTemp."""
+        self._lib.rotary_dimmer_set_mode(self._handle, ctypes.c_uint8(mode))
 
     def process(self, x: float, y: float, z: float, now_ms: int) -> RotaryUpdateC:
         """Process a 3-axis accelerometer sample (m/s^2) at timestamp now_ms."""
@@ -88,6 +94,8 @@ def compiled_dimmer_lib(tmp_path_factory: pytest.TempPathFactory) -> ctypes.CDLL
     lib.rotary_dimmer_destroy.restype = None
     lib.rotary_dimmer_reset.argtypes = [ctypes.c_void_p]
     lib.rotary_dimmer_reset.restype = None
+    lib.rotary_dimmer_set_mode.argtypes = [ctypes.c_void_p, ctypes.c_uint8]
+    lib.rotary_dimmer_set_mode.restype = None
     lib.rotary_dimmer_process.argtypes = [
         ctypes.c_void_p,
         ctypes.c_double,
@@ -116,35 +124,61 @@ def test_wake_baseline_does_not_emit_step(dimmer: RotaryDimmerWrapper) -> None:
 
 
 def test_live_updates_emitted_while_turning_clockwise(dimmer: RotaryDimmerWrapper) -> None:
-    """Verify continuous clockwise rotation emits live positive steps before movement stops."""
+    """Verify continuous clockwise rotation emits live positive steps in Brightness mode (1..100)."""
     dimmer.process_angle_deg(0.0, now_ms=0)
 
-    live_steps = []
+    live_updates = []
     for tick in range(1, 13):
         res = dimmer.process_angle_deg(tick * 5.0, now_ms=tick * 50)
         assert res.movementDetected
         if res.hasStep:
-            live_steps.append(res.stepPercent)
+            live_updates.append((res.stepPercent, res.encodedPosition, res.mode))
 
-    assert len(live_steps) >= 3
-    assert all(step > 0 for step in live_steps)
-    assert sum(live_steps) >= 25
+    assert len(live_updates) >= 3
+    for step_pct, encoded_pos, mode in live_updates:
+        assert mode == 0
+        assert step_pct > 0
+        assert encoded_pos == step_pct
+        assert 1 <= encoded_pos <= 100
 
 
 def test_live_updates_emitted_while_turning_counter_clockwise(dimmer: RotaryDimmerWrapper) -> None:
     """Verify continuous counter-clockwise rotation emits live negative steps while turning."""
     dimmer.process_angle_deg(90.0, now_ms=0)
 
-    live_steps = []
+    live_updates = []
     for tick in range(1, 13):
         res = dimmer.process_angle_deg(90.0 - tick * 5.0, now_ms=tick * 50)
         assert res.movementDetected
         if res.hasStep:
-            live_steps.append(res.stepPercent)
+            live_updates.append((res.stepPercent, res.encodedPosition))
 
-    assert len(live_steps) >= 3
-    assert all(step < 0 for step in live_steps)
-    assert sum(live_steps) <= -25
+    assert len(live_updates) >= 3
+    for step_pct, encoded_pos in live_updates:
+        assert step_pct < 0
+        assert encoded_pos == abs(step_pct)
+
+
+def test_color_temperature_mode_encodes_positions_101_to_200(dimmer: RotaryDimmerWrapper) -> None:
+    """Verify double-click ColorTemp mode encodes positions in 101..200 and preserves brightness."""
+    dimmer.set_mode(1)
+    dimmer.reset()
+    initial = dimmer.process_angle_deg(0.0, now_ms=0)
+    initial_brightness = initial.targetLevel
+
+    res_cw = None
+    for tick in range(1, 5):
+        res = dimmer.process_angle_deg(tick * 6.0, now_ms=tick * 50)
+        if res.hasStep:
+            res_cw = res
+            break
+
+    assert res_cw is not None
+    assert res_cw.mode == 1
+    assert res_cw.stepPercent > 0
+    assert res_cw.encodedPosition == 100 + res_cw.stepPercent
+    assert 101 <= res_cw.encodedPosition <= 200
+    assert res_cw.targetLevel == initial_brightness
 
 
 def test_settle_flushes_residual_rotation(dimmer: RotaryDimmerWrapper) -> None:
@@ -216,6 +250,7 @@ def test_firmware_and_ci_configuration() -> None:
     assert "EnterAccelIdleMode" in app_task
     assert "StartAccelDimming" in app_task
     assert "EmitRotationStep" in app_task
+    assert "RotaryControlMode::ColorTemp" in app_task
 
     workflow = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text()
     assert "micro_matter_button_h25015_om1.hex" in workflow

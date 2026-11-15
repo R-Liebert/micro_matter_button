@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 void RotaryDimmer::ResetOnWake()
 {
@@ -42,9 +43,14 @@ void RotaryDimmer::FlushPendingDelta(uint32_t nowMs, RotaryUpdate &outUpdate)
 	}
 	stepPercent = std::clamp<int8_t>(stepPercent, -100, 100);
 
+	uint8_t magnitudePct = static_cast<uint8_t>(std::clamp<int>(std::abs(stepPercent), 1, 100));
+	uint8_t offset = (mControlMode == RotaryControlMode::ColorTemp) ? kColorTempPositionOffset : 0U;
+
 	outUpdate.hasStep = true;
+	outUpdate.mode = mControlMode;
 	outUpdate.stepLevel = stepLevel;
 	outUpdate.stepPercent = stepPercent;
+	outUpdate.encodedPosition = static_cast<uint8_t>(magnitudePct + offset);
 	outUpdate.targetLevel = static_cast<uint8_t>(std::round(mAccumulatedBrightness));
 
 	mPendingAngleDelta = 0.0;
@@ -54,6 +60,7 @@ void RotaryDimmer::FlushPendingDelta(uint32_t nowMs, RotaryUpdate &outUpdate)
 RotaryUpdate RotaryDimmer::ProcessSample(double x, double y, double z, uint32_t nowMs)
 {
 	RotaryUpdate update;
+	update.mode = mControlMode;
 	update.targetLevel = static_cast<uint8_t>(std::round(mAccumulatedBrightness));
 
 	if (std::abs(z) > kHorizontalZLimit) {
@@ -88,8 +95,10 @@ RotaryUpdate RotaryDimmer::ProcessSample(double x, double y, double z, uint32_t 
 		mLastAngle = currentAngle;
 		mLastMovementTimeMs = nowMs;
 		mPendingAngleDelta += deltaAngle;
-		mAccumulatedBrightness = std::clamp(
-			mAccumulatedBrightness + (deltaAngle * kRotationToLevelMultiplier), 1.0, 254.0);
+		if (mControlMode == RotaryControlMode::Brightness) {
+			mAccumulatedBrightness = std::clamp(
+				mAccumulatedBrightness + (deltaAngle * kRotationToLevelMultiplier), 1.0, 254.0);
+		}
 		update.targetLevel = static_cast<uint8_t>(std::round(mAccumulatedBrightness));
 		update.movementDetected = true;
 
@@ -132,6 +141,17 @@ void rotary_dimmer_reset(RotaryDimmer *dimmer)
 {
 	if (dimmer) {
 		dimmer->ResetOnWake();
+	}
+}
+
+/**
+ * @brief C-ABI wrapper to set the control mode (0 = Brightness, 1 = ColorTemp).
+ */
+void rotary_dimmer_set_mode(RotaryDimmer *dimmer, uint8_t mode)
+{
+	if (dimmer) {
+		dimmer->SetControlMode(
+			mode == 1 ? RotaryControlMode::ColorTemp : RotaryControlMode::Brightness);
 	}
 }
 
