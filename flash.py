@@ -13,7 +13,7 @@ from pyocd.probe.pydapaccess import DAPAccess
 
 
 def main() -> int:
-    """Poll the SWD probe at 50 Hz and flash the target hex in-process on contact."""
+    """Poll the SWD probe at 50 Hz using JTAG-to-SWD (0xE79E) and flash on contact."""
     btn_num = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     repo_dir = Path(__file__).resolve().parent
     hex_path = repo_dir / "build_hex" / "variants" / f"Egen_superknapp_{btn_num:02d}.hex"
@@ -25,17 +25,17 @@ def main() -> int:
     print("Hold the pogo clip on the pads. Probing 50 times/sec...")
 
     dap = None
-    last_status = ""
+    attempt = 0
+    use_dormant = False
 
     while True:
+        attempt += 1
         try:
             if dap is None:
                 devs = DAPAccess.get_connected_devices()
                 if not devs:
-                    status = "[USB] Waiting for Nano RP2040 Connect probe..."
-                    if status != last_status:
-                        print(status)
-                        last_status = status
+                    sys.stdout.write(f"\r[{attempt:05d}] [USB] Waiting for Nano RP2040 Connect probe...          ")
+                    sys.stdout.flush()
                     time.sleep(0.2)
                     continue
                 dap = devs[0]
@@ -43,14 +43,20 @@ def main() -> int:
                 dap.connect(DAPAccess.PORT.SWD)
                 dap.set_clock(400000)
 
-            # Send official ADIv6 Dormant-to-SWD + Line Reset sequence
-            dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
-            dap.swj_sequence(31, 0x33BBFFFF)
-            dap.swj_sequence(8, 0xFF)
-            dap.swj_sequence(128, 0x19BC0EA2E3DDAFE986852D956209F392)
-            dap.swj_sequence(12, 0x01A0)
-            dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
-            dap.swj_sequence(8, 0x00)
+            # Alternate between standard JTAG-to-SWD (0xE79E) and ADIv6 Dormant-to-SWD
+            if not use_dormant:
+                dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
+                dap.swj_sequence(16, 0xE79E)
+                dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
+                dap.swj_sequence(8, 0x00)
+            else:
+                dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
+                dap.swj_sequence(39, 0x33BBBBBA)
+                dap.swj_sequence(136, 0x19BC0EA2E3DDAFE986852D956209F392FF)
+                dap.swj_sequence(12, 0x01A0)
+                dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
+                dap.swj_sequence(8, 0x00)
+            use_dormant = not use_dormant
 
             dpidr = dap.read_reg(DAPAccess.REG.DP_0x0, now=True)
             print(f"\a\n>>> TARGET LOCKED! DPIDR = 0x{dpidr:08X} — HOLD STEADY, FLASHING NOW... <<<")
@@ -78,21 +84,20 @@ def main() -> int:
             return 130
         except Exception as exc:
             msg = str(exc)
-            if "Unexpected ACK (0)" in msg:
-                status = "State: [ACK=0] SWDIO pulled LOW (check D10/D11 order or VCC power)"
+            if "Unexpected ACK" in msg:
+                status = "[ACK=0] SWDIO is LOW (0V) — check D10/D11 swap or VCC contact   "
             elif "No ACK" in msg:
-                status = "State: [No ACK] Waiting for all 4 pogo pins to touch pads..."
+                status = "[No ACK] Open circuit — press pogo pins onto the 4 pads...      "
             else:
-                status = f"State: [{type(exc).__name__}] {msg}"
+                status = f"[{type(exc).__name__}] Reconnecting probe...                         "
                 if dap is not None:
                     try:
                         dap.close()
                     except Exception:
                         pass
                     dap = None
-            if status != last_status:
-                print(status)
-                last_status = status
+            sys.stdout.write(f"\r[{attempt:05d}] {status}")
+            sys.stdout.flush()
             time.sleep(0.015)
 
 
