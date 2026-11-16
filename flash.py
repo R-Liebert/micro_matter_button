@@ -8,12 +8,15 @@ import sys
 import time
 
 from pyocd.core.helpers import ConnectHelper
+from pyocd.core.session import Session
 from pyocd.flash.file_programmer import FileProgrammer
-from pyocd.probe.pydapaccess import DAPAccess
+from pyocd.probe.cmsis_dap_probe import CMSISDAPProbe
+from pyocd.probe.debug_probe import DebugProbe
+from pyocd.probe.swj import SWJSequenceSender
 
 
 def main() -> int:
-    """Poll the SWD probe at 50 Hz using JTAG-to-SWD (0xE79E) and flash on contact."""
+    """Poll the SWD probe at 50 Hz using pyOCD's SWJ sequences and flash on contact."""
     check_only = "--check" in sys.argv
     args = [a for a in sys.argv[1:] if a != "--check"]
     btn_num = int(args[0]) if args else 2
@@ -29,39 +32,41 @@ def main() -> int:
         print(f"=== Fast 50 Hz Auto-Flasher armed for Button {btn_num:02d} ({hex_path.name}) ===")
     print("Hold the pogo clip on the pads. Probing 50 times/sec...")
 
-    dap = None
+    probe = None
+    swj = None
     attempt = 0
     use_dormant = False
 
     while True:
         attempt += 1
         try:
-            if dap is None:
-                devs = DAPAccess.get_connected_devices()
-                if not devs:
+            if probe is None:
+                probes = CMSISDAPProbe.get_all_connected_probes()
+                if not probes:
                     sys.stdout.write(f"\r[{attempt:05d}] [USB] Waiting for Nano RP2040 Connect probe...          ")
                     sys.stdout.flush()
                     time.sleep(0.2)
                     continue
-                dap = devs[0]
-                dap.open()
-                dap.connect(DAPAccess.PORT.SWD)
-                dap.set_clock(400000)
+                probe = probes[0]
+                Session(probe, options={"target_override": "nrf54l"})
+                probe.open()
+                probe.connect(DebugProbe.Protocol.SWD)
+                probe.set_clock(400000)
+                swj = SWJSequenceSender(probe, use_dormant=False)
 
-            # Standard JTAG-to-SWD (0xE79E) + Line Reset sequence
-            dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
-            dap.swj_sequence(16, 0xE79E)
-            dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
-            dap.swj_sequence(8, 0x00)
+            swj.use_dormant = use_dormant
+            use_dormant = not use_dormant
+            swj.select_protocol(DebugProbe.Protocol.SWD)
+            dpidr = probe.read_dp(0x0, now=True)
 
-            dpidr = dap.read_reg(DAPAccess.REG.DP_0x0, now=True)
             if check_only:
                 print(f"\a\n>>> READ-ONLY TARGET LOCKED! DPIDR = 0x{dpidr:08X} <<<")
-                dap.close()
+                probe.close()
                 return 0
+
             print(f"\a\n>>> TARGET LOCKED! DPIDR = 0x{dpidr:08X} — HOLD STEADY, FLASHING NOW... <<<")
-            dap.close()
-            dap = None
+            probe.close()
+            probe = None
 
             with ConnectHelper.session_with_chosen_probe(
                 target_override="nrf54l",
@@ -76,9 +81,9 @@ def main() -> int:
 
         except KeyboardInterrupt:
             print("\nStopped by user.")
-            if dap is not None:
+            if probe is not None:
                 try:
-                    dap.close()
+                    probe.close()
                 except Exception:
                     pass
             return 130
@@ -90,12 +95,13 @@ def main() -> int:
                 status = "[No ACK] Open circuit — press pogo pins onto the 4 pads...      "
             else:
                 status = f"[{type(exc).__name__}] Reconnecting probe...                         "
-                if dap is not None:
+                if probe is not None:
                     try:
-                        dap.close()
+                        probe.close()
                     except Exception:
                         pass
-                    dap = None
+                    probe = None
+                    swj = None
             sys.stdout.write(f"\r[{attempt:05d}] {status}")
             sys.stdout.flush()
             time.sleep(0.015)
