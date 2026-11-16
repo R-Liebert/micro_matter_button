@@ -43,20 +43,11 @@ def main() -> int:
                 dap.connect(DAPAccess.PORT.SWD)
                 dap.set_clock(400000)
 
-            # Alternate between standard JTAG-to-SWD (0xE79E) and ADIv6 Dormant-to-SWD
-            if not use_dormant:
-                dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
-                dap.swj_sequence(16, 0xE79E)
-                dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
-                dap.swj_sequence(8, 0x00)
-            else:
-                dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
-                dap.swj_sequence(39, 0x33BBBBBA)
-                dap.swj_sequence(136, 0x19BC0EA2E3DDAFE986852D956209F392FF)
-                dap.swj_sequence(12, 0x01A0)
-                dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
-                dap.swj_sequence(8, 0x00)
-            use_dormant = not use_dormant
+            # Standard JTAG-to-SWD (0xE79E) + Line Reset sequence
+            dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
+            dap.swj_sequence(16, 0xE79E)
+            dap.swj_sequence(51, 0xFFFFFFFFFFFFFF)
+            dap.swj_sequence(8, 0x00)
 
             dpidr = dap.read_reg(DAPAccess.REG.DP_0x0, now=True)
             print(f"\a\n>>> TARGET LOCKED! DPIDR = 0x{dpidr:08X} — HOLD STEADY, FLASHING NOW... <<<")
