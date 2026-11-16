@@ -67,3 +67,11 @@ def test_patch_and_generate_batch_on_real_hex(tmp_path: Path) -> None:
                 continue
             rec = bytes.fromhex(line[1:])
             assert (sum(rec) & 0xFF) == 0
+
+
+def test_flash_script_loads_cleanly() -> None:
+    """Verify the 50 Hz flash helper script compiles and exposes main()."""
+    import flash
+
+    assert callable(flash.main)
+
