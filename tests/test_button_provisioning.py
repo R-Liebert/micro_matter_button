@@ -37,6 +37,8 @@ def test_20_button_configs_are_all_unique() -> None:
     assert len({c.qr_payload for c in configs}) == 20
     assert len({c.verifier_b64 for c in configs}) == 20
     assert configs[0].device_name == "Egen_superknapp_01"
+    assert configs[0].manual_pairing_code == "34970112332"
+    assert configs[0].qr_payload == "MT:4CT9142C00KA0648G00"
     assert configs[-1].device_name == "Egen_superknapp_20"
 
 

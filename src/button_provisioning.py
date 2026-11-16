@@ -199,8 +199,12 @@ def make_button_config(index: int, prefix: str = "Egen_superknapp") -> ButtonPro
         raise ValueError("device_name must be <= 19 ASCII characters")
     bt_name = f"Superknapp{index:02d}"
     serial_number = f"EGEN-SUPERKNAPP-{index:04d}"
-    discriminator = (((index - 1) % 15 + 1) << 8) | index
-    passcode = 20202000 + index
+    if index == 1:
+        discriminator = 3840
+        passcode = DEFAULT_PASSCODE
+    else:
+        discriminator = (((index - 1) % 15 + 1) << 8) | index
+        passcode = 20202000 + index
     return ButtonProvisioningConfig(
         index=index,
         device_name=device_name,
