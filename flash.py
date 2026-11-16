@@ -14,14 +14,19 @@ from pyocd.probe.pydapaccess import DAPAccess
 
 def main() -> int:
     """Poll the SWD probe at 50 Hz using JTAG-to-SWD (0xE79E) and flash on contact."""
-    btn_num = int(sys.argv[1]) if len(sys.argv) > 1 else 2
+    check_only = "--check" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--check"]
+    btn_num = int(args[0]) if args else 2
     repo_dir = Path(__file__).resolve().parent
     hex_path = repo_dir / "build_hex" / "variants" / f"Egen_superknapp_{btn_num:02d}.hex"
-    if not hex_path.exists():
+    if not check_only and not hex_path.exists():
         print(f"Error: {hex_path} not found.")
         return 1
 
-    print(f"=== Fast 50 Hz Auto-Flasher armed for Button {btn_num:02d} ({hex_path.name}) ===")
+    if check_only:
+        print("=== Read-Only 50 Hz SWD Detector (will NOT flash or erase) ===")
+    else:
+        print(f"=== Fast 50 Hz Auto-Flasher armed for Button {btn_num:02d} ({hex_path.name}) ===")
     print("Hold the pogo clip on the pads. Probing 50 times/sec...")
 
     dap = None
@@ -50,6 +55,10 @@ def main() -> int:
             dap.swj_sequence(8, 0x00)
 
             dpidr = dap.read_reg(DAPAccess.REG.DP_0x0, now=True)
+            if check_only:
+                print(f"\a\n>>> READ-ONLY TARGET LOCKED! DPIDR = 0x{dpidr:08X} <<<")
+                dap.close()
+                return 0
             print(f"\a\n>>> TARGET LOCKED! DPIDR = 0x{dpidr:08X} — HOLD STEADY, FLASHING NOW... <<<")
             dap.close()
             dap = None
